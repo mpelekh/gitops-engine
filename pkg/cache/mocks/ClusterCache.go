@@ -195,6 +195,11 @@ func (_m *ClusterCache) IterateHierarchy(key kube.ResourceKey, action func(*cach
 	_m.Called(key, action)
 }
 
+// IterateHierarchyV2 provides a mock function with given fields: keys, action
+func (_m *ClusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(*cache.Resource, map[kube.ResourceKey]*cache.Resource) bool) {
+	_m.Called(keys, action)
+}
+
 // OnEvent provides a mock function with given fields: handler
 func (_m *ClusterCache) OnEvent(handler cache.OnEventHandler) cache.Unsubscribe {
 	ret := _m.Called(handler)
