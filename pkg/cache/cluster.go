@@ -104,7 +104,7 @@ type OnResourceUpdatedHandler func(newRes *Resource, oldRes *Resource, namespace
 type OnResourceLockAcquireHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
 
 // OnProcessEventHandler handlers process event
-type OnProcessEventHandler func(event watch.EventType, un *unstructured.Unstructured, count int)
+type OnProcessEventHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
 
 type Unsubscribe func()
 
@@ -722,19 +722,14 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					return fmt.Errorf("Failed to convert to *unstructured.Unstructured: %v", event.Object)
 				}
 
-				unprocessedEventsNumber := len(w.ResultChan())
-				c.log.V(1).Info(
-					"Received event from ResultChan",
+				log := c.log.WithValues(
 					"event", event.Type,
 					"groupKind", obj.GroupVersionKind().GroupKind().String(),
 					"namespace", obj.GetNamespace(),
 					"name", obj.GetName(),
-					"unprocessedEventsNumber", unprocessedEventsNumber,
 				)
-				// Update the metric with the length of the ResultChan at the beginning of processing
-				for _, handler := range c.getProcessEventHandlers() {
-					handler(event.Type, obj, unprocessedEventsNumber)
-				}
+				start := time.Now()
+				log.V(1).Info("Received event from ResultChan")
 
 				c.processEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
@@ -800,18 +795,11 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					}
 				}
 
-				unprocessedEventsNumber = len(w.ResultChan())
-				c.log.V(1).Info(
-					"Handled event from ResultChan",
-					"event", event.Type,
-					"groupKind", obj.GroupVersionKind().GroupKind().String(),
-					"namespace", obj.GetNamespace(),
-					"name", obj.GetName(),
-					"unprocessedEventsNumber", unprocessedEventsNumber,
-				)
-				// Update the metric with the length of the ResultChan at the end of processing
+				duration := time.Since(start)
+				log.V(1).Info("Handled event from ResultChan", "duration", duration.Milliseconds())
+				// Update the metric with the duration of the event processing
 				for _, handler := range c.getProcessEventHandlers() {
-					handler(event.Type, obj, unprocessedEventsNumber)
+					handler(event.Type, obj, duration)
 				}
 			}
 		}
