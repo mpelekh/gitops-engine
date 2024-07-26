@@ -106,6 +106,9 @@ type OnResourceLockAcquireHandler func(event watch.EventType, un *unstructured.U
 // OnProcessEventHandler handlers process event
 type OnProcessEventHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
 
+// OnIterateHierarchyHandler handlers resource hierarchy iteration event
+type OnIterateHierarchyHandler func(kind, namespace string, duration time.Duration, acquireLockDuration time.Duration)
+
 type Unsubscribe func()
 
 type ClusterCache interface {
@@ -143,6 +146,8 @@ type ClusterCache interface {
 	OnResourceLockAcquire(handler OnResourceLockAcquireHandler) Unsubscribe
 	// OnProcessEventHandler register event handler that is executed every time when event received
 	OnProcessEventHandler(handler OnProcessEventHandler) Unsubscribe
+	// OnIterateHierarchyHandler register event handler that is executed every time when hierarchy is iterated
+	OnIterateHierarchyHandler(handler OnIterateHierarchyHandler) Unsubscribe
 }
 
 type WeightedSemaphore interface {
@@ -179,6 +184,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		eventHandlers:              map[uint64]OnEventHandler{},
 		resourceLockAcquireHandler: map[uint64]OnResourceLockAcquireHandler{},
 		processEventHandlers:       map[uint64]OnProcessEventHandler{},
+		iterateHierarchyHandlers:   map[uint64]OnIterateHierarchyHandler{},
 		log:                        log,
 		listRetryLimit:             1,
 		listRetryUseBackoff:        false,
@@ -234,6 +240,7 @@ type clusterCache struct {
 	eventHandlers               map[uint64]OnEventHandler
 	resourceLockAcquireHandler  map[uint64]OnResourceLockAcquireHandler
 	processEventHandlers        map[uint64]OnProcessEventHandler
+	iterateHierarchyHandlers    map[uint64]OnIterateHierarchyHandler
 	openAPISchema               openapi.Resources
 	gvkParser                   *managedfields.GvkParser
 
@@ -352,6 +359,30 @@ func (c *clusterCache) getProcessEventHandlers() []OnProcessEventHandler {
 	defer c.handlersLock.Unlock()
 	handlers := make([]OnProcessEventHandler, 0, len(c.processEventHandlers))
 	for _, h := range c.processEventHandlers {
+		handlers = append(handlers, h)
+	}
+	return handlers
+}
+
+// OnIterateHierarchyHandler register event handler that is executed every time when hierarchy is iterated
+func (c *clusterCache) OnIterateHierarchyHandler(handler OnIterateHierarchyHandler) Unsubscribe {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	key := c.handlerKey
+	c.handlerKey++
+	c.iterateHierarchyHandlers[key] = handler
+	return func() {
+		c.handlersLock.Lock()
+		defer c.handlersLock.Unlock()
+		delete(c.iterateHierarchyHandlers, key)
+	}
+}
+
+func (c *clusterCache) getIterateHierarchyHandlers() []OnIterateHierarchyHandler {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	handlers := make([]OnIterateHierarchyHandler, 0, len(c.iterateHierarchyHandlers))
+	for _, h := range c.iterateHierarchyHandlers {
 		handlers = append(handlers, h)
 	}
 	return handlers
@@ -1063,6 +1094,10 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 		lockReleased := time.Now()
 		ms := lockReleased.Sub(lockAcquired).Milliseconds()
 		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+
+		for _, handler := range c.getIterateHierarchyHandlers() {
+			handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
+		}
 	}()
 
 	duration := lockAcquired.Sub(start)
