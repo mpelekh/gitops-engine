@@ -99,6 +99,16 @@ type OnPopulateResourceInfoHandler func(un *unstructured.Unstructured, isRoot bo
 
 // OnResourceUpdatedHandler handlers resource update event
 type OnResourceUpdatedHandler func(newRes *Resource, oldRes *Resource, namespaceResources map[kube.ResourceKey]*Resource)
+
+// OnResourceLockAcquireHandler handlers resource lock acquire event
+type OnResourceLockAcquireHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
+
+// OnProcessEventHandler handlers process event
+type OnProcessEventHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
+
+// OnIterateHierarchyHandler handlers resource hierarchy iteration event
+type OnIterateHierarchyHandler func(kind, namespace string, duration time.Duration, acquireLockDuration time.Duration)
+
 type Unsubscribe func()
 
 type ClusterCache interface {
@@ -135,6 +145,12 @@ type ClusterCache interface {
 	OnResourceUpdated(handler OnResourceUpdatedHandler) Unsubscribe
 	// OnEvent register event handler that is executed every time when new K8S event received
 	OnEvent(handler OnEventHandler) Unsubscribe
+	// OnResourceLockAcquire register event handler that is executed every time when resource lock is acquired by goroutine
+	OnResourceLockAcquire(handler OnResourceLockAcquireHandler) Unsubscribe
+	// OnProcessEventHandler register event handler that is executed every time when event received
+	OnProcessEventHandler(handler OnProcessEventHandler) Unsubscribe
+	// OnIterateHierarchyHandler register event handler that is executed every time when hierarchy is iterated
+	OnIterateHierarchyHandler(handler OnIterateHierarchyHandler) Unsubscribe
 }
 
 type WeightedSemaphore interface {
@@ -165,14 +181,17 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 			resyncTimeout: defaultClusterResyncTimeout,
 			syncTime:      nil,
 		},
-		watchResyncTimeout:      defaultWatchResyncTimeout,
-		clusterSyncRetryTimeout: ClusterRetryTimeout,
-		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
-		eventHandlers:           map[uint64]OnEventHandler{},
-		log:                     log,
-		listRetryLimit:          1,
-		listRetryUseBackoff:     false,
-		listRetryFunc:           ListRetryFuncNever,
+		watchResyncTimeout:         defaultWatchResyncTimeout,
+		clusterSyncRetryTimeout:    ClusterRetryTimeout,
+		resourceUpdatedHandlers:    map[uint64]OnResourceUpdatedHandler{},
+		eventHandlers:              map[uint64]OnEventHandler{},
+		resourceLockAcquireHandler: map[uint64]OnResourceLockAcquireHandler{},
+		processEventHandlers:       map[uint64]OnProcessEventHandler{},
+		iterateHierarchyHandlers:   map[uint64]OnIterateHierarchyHandler{},
+		log:                        log,
+		listRetryLimit:             1,
+		listRetryUseBackoff:        false,
+		listRetryFunc:              ListRetryFuncNever,
 	}
 	for i := range opts {
 		opts[i](cache)
@@ -222,6 +241,9 @@ type clusterCache struct {
 	populateResourceInfoHandler OnPopulateResourceInfoHandler
 	resourceUpdatedHandlers     map[uint64]OnResourceUpdatedHandler
 	eventHandlers               map[uint64]OnEventHandler
+	resourceLockAcquireHandler  map[uint64]OnResourceLockAcquireHandler
+	processEventHandlers        map[uint64]OnProcessEventHandler
+	iterateHierarchyHandlers    map[uint64]OnIterateHierarchyHandler
 	openAPISchema               openapi.Resources
 	gvkParser                   *managedfields.GvkParser
 
@@ -292,6 +314,78 @@ func (c *clusterCache) getEventHandlers() []OnEventHandler {
 	defer c.handlersLock.Unlock()
 	handlers := make([]OnEventHandler, 0, len(c.eventHandlers))
 	for _, h := range c.eventHandlers {
+		handlers = append(handlers, h)
+	}
+	return handlers
+}
+
+// OnResourceLockAcquire register event handler that is executed every time when resource lock is acquired by goroutine
+func (c *clusterCache) OnResourceLockAcquire(handler OnResourceLockAcquireHandler) Unsubscribe {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	key := c.handlerKey
+	c.handlerKey++
+	c.resourceLockAcquireHandler[key] = handler
+	return func() {
+		c.handlersLock.Lock()
+		defer c.handlersLock.Unlock()
+		delete(c.resourceLockAcquireHandler, key)
+	}
+}
+
+func (c *clusterCache) getResourceLockAcquireHandlers() []OnResourceLockAcquireHandler {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	handlers := make([]OnResourceLockAcquireHandler, 0, len(c.resourceLockAcquireHandler))
+	for _, h := range c.resourceLockAcquireHandler {
+		handlers = append(handlers, h)
+	}
+	return handlers
+}
+
+// OnProcessEventHandler register event handler that is executed every time when event received
+func (c *clusterCache) OnProcessEventHandler(handler OnProcessEventHandler) Unsubscribe {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	key := c.handlerKey
+	c.handlerKey++
+	c.processEventHandlers[key] = handler
+	return func() {
+		c.handlersLock.Lock()
+		defer c.handlersLock.Unlock()
+		delete(c.processEventHandlers, key)
+	}
+}
+
+func (c *clusterCache) getProcessEventHandlers() []OnProcessEventHandler {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	handlers := make([]OnProcessEventHandler, 0, len(c.processEventHandlers))
+	for _, h := range c.processEventHandlers {
+		handlers = append(handlers, h)
+	}
+	return handlers
+}
+
+// OnIterateHierarchyHandler register event handler that is executed every time when hierarchy is iterated
+func (c *clusterCache) OnIterateHierarchyHandler(handler OnIterateHierarchyHandler) Unsubscribe {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	key := c.handlerKey
+	c.handlerKey++
+	c.iterateHierarchyHandlers[key] = handler
+	return func() {
+		c.handlersLock.Lock()
+		defer c.handlersLock.Unlock()
+		delete(c.iterateHierarchyHandlers, key)
+	}
+}
+
+func (c *clusterCache) getIterateHierarchyHandlers() []OnIterateHierarchyHandler {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	handlers := make([]OnIterateHierarchyHandler, 0, len(c.iterateHierarchyHandlers))
+	for _, h := range c.iterateHierarchyHandlers {
 		handlers = append(handlers, h)
 	}
 	return handlers
@@ -666,6 +760,15 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					return fmt.Errorf("Failed to convert to *unstructured.Unstructured: %v", event.Object)
 				}
 
+				log := c.log.WithValues(
+					"event", event.Type,
+					"groupKind", obj.GroupVersionKind().GroupKind().String(),
+					"namespace", obj.GetNamespace(),
+					"name", obj.GetName(),
+				)
+				start := time.Now()
+				log.V(1).Info("Received event from ResultChan")
+
 				c.processEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
 					var resources []kube.APIResourceInfo
@@ -725,6 +828,13 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					if err != nil {
 						c.log.Error(err, "Failed to reload open api schema")
 					}
+				}
+
+				duration := time.Since(start)
+				log.V(1).Info("Handled event from ResultChan", "duration", duration.Milliseconds())
+				// Update the metric with the duration of the event processing
+				for _, handler := range c.getProcessEventHandlers() {
+					handler(event.Type, obj, duration)
 				}
 			}
 		}
@@ -969,8 +1079,30 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
 func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
+	log := c.log.WithValues(
+		"fn", "IterateHierarchy",
+		"resource", key,
+	)
+
+	log.V(1).Info("Iterating hierarchy")
+
+	start := time.Now()
 	c.lock.RLock()
-	defer c.lock.RUnlock()
+	lockAcquired := time.Now()
+	defer func() {
+		c.lock.RUnlock()
+		lockReleased := time.Now()
+		ms := lockReleased.Sub(lockAcquired).Milliseconds()
+		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+
+		for _, handler := range c.getIterateHierarchyHandlers() {
+			handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
+		}
+	}()
+
+	duration := lockAcquired.Sub(start)
+	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+
 	if res, ok := c.resources[key]; ok {
 		nsNodes := c.nsIndex[key.Namespace]
 		if !action(res, nsNodes) {
@@ -1213,16 +1345,41 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 }
 
 func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unstructured) {
+	log := c.log.WithValues(
+		"fn", "processEvent",
+		"event", event,
+		"kind", un.GetKind(),
+		"namespace", un.GetNamespace(),
+		"name", un.GetName(),
+	)
+
+	log.V(1).Info("Process event")
+
 	for _, h := range c.getEventHandlers() {
 		h(event, un)
 	}
 	key := kube.GetResourceKey(un)
 	if event == watch.Modified && skipAppRequeuing(key) {
+		log.V(1).Info("Skipping requeue for resource")
 		return
 	}
 
+	start := time.Now()
 	c.lock.Lock()
-	defer c.lock.Unlock()
+	lockAcquired := time.Now()
+	defer func() {
+		c.lock.Unlock()
+		lockReleased := time.Now()
+		ms := lockReleased.Sub(lockAcquired).Milliseconds()
+		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+	}()
+
+	duration := lockAcquired.Sub(start)
+	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+	for _, h := range c.getResourceLockAcquireHandlers() {
+		h(event, un, duration)
+	}
+
 	existingNode, exists := c.resources[key]
 	if event == watch.Deleted {
 		if exists {
