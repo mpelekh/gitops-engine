@@ -1098,9 +1098,10 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 		ms := lockReleased.Sub(lockAcquired).Milliseconds()
 		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
 
-		for _, handler := range c.getIterateHierarchyHandlers() {
-			handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
-		}
+		// Commented it, since going to collect metrics from IterateHierarchyV2
+		// for _, handler := range c.getIterateHierarchyHandlers() {
+		// 	handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
+		// }
 	}()
 
 	duration := lockAcquired.Sub(start)
@@ -1144,8 +1145,28 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 
 // IterateHierarchy iterates resource tree starting from the specified top level resources and executes callback for each resource in the tree
 func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
+	log := c.log.WithValues("fn", "IterateHierarchyV2")
+
+	log.V(1).Info("Iterating hierarchy")
+
+	start := time.Now()
 	c.lock.RLock()
-	defer c.lock.RUnlock()
+	lockAcquired := time.Now()
+
+	defer func() {
+		c.lock.RUnlock()
+		lockReleased := time.Now()
+		ms := lockReleased.Sub(lockAcquired).Milliseconds()
+		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+
+		for _, handler := range c.getIterateHierarchyHandlers() {
+			handler("", "", lockReleased.Sub(start), lockAcquired.Sub(start))
+		}
+	}()
+
+	duration := lockAcquired.Sub(start)
+	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+
 	keysPerNamespace := make(map[string][]kube.ResourceKey)
 	for _, key := range keys {
 		_, ok := c.resources[key]
