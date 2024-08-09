@@ -765,7 +765,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 				start := time.Now()
 				log.V(1).Info("Received event from ResultChan")
 
-				c.processEvent(event.Type, obj)
+				go c.processEvent(event.Type, obj)
 				if kube.IsCRD(obj) {
 					var resources []kube.APIResourceInfo
 					crd := v1.CustomResourceDefinition{}
