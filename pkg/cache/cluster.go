@@ -170,9 +170,9 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		listPageSize:       defaultListPageSize,
 		listPageBufferSize: defaultListPageBufferSize,
 		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
-		resources:          make(map[kube.ResourceKey]*Resource),
-		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
-		config:             config,
+		resources:          NewResourceMap(),
+		// nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
+		config: config,
 		kubectl: &kube.KubectlCmd{
 			Log:    log,
 			Tracer: tracing.NopTracer{},
@@ -197,6 +197,26 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		opts[i](cache)
 	}
 	return cache
+}
+
+type ResourceMap struct {
+	// The outer map itself is protected by a global lock.
+	// mu                    sync.RWMutex
+	resourcesByKinds      sync.Map
+	resourcesByNamespaces sync.Map
+	// A separate lock for each inner map (kind level).
+	// kindLocks map[string]*sync.RWMutex
+	// A separate lock for each inner map (namespace level).
+	// namespaceLocks map[string]*sync.RWMutex
+}
+
+func NewResourceMap() *ResourceMap {
+	return &ResourceMap{
+		// resourcesByKinds:      make(map[string]map[kube.ResourceKey]*Resource),
+		// resourcesByNamespaces: make(map[string]map[kube.ResourceKey]*Resource),
+		// kindLocks:             make(map[string]*sync.RWMutex),
+		// namespaceLocks:        make(map[string]*sync.RWMutex),
+	}
 }
 
 type clusterCache struct {
@@ -226,8 +246,8 @@ type clusterCache struct {
 
 	// lock is a rw lock which protects the fields of clusterInfo
 	lock      sync.RWMutex
-	resources map[kube.ResourceKey]*Resource
-	nsIndex   map[string]map[kube.ResourceKey]*Resource
+	resources *ResourceMap
+	// nsIndex   map[string]map[kube.ResourceKey]*Resource
 
 	kubectl          kube.Kubectl
 	log              logr.Logger
@@ -445,24 +465,23 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 		objByKey[resources[i].ResourceKey()] = resources[i]
 	}
 
+	resourcesByKind, _ := c.resources.resourcesByKinds.Load(gk.Kind)
+
 	// update existing nodes
 	for i := range resources {
 		res := resources[i]
-		oldRes := c.resources[res.ResourceKey()]
-		if oldRes == nil || oldRes.ResourceVersion != res.ResourceVersion {
-			c.onNodeUpdated(oldRes, res)
+		oldRes, _ := resourcesByKind.(*sync.Map).Load(res.ResourceKey())
+		if oldRes == nil || oldRes.(*Resource).ResourceVersion != res.ResourceVersion {
+			c.onNodeUpdated(oldRes.(*Resource), res)
 		}
 	}
 
-	for key := range c.resources {
-		if key.Kind != gk.Kind || key.Group != gk.Group || ns != "" && key.Namespace != ns {
-			continue
+	resourcesByKind.(*sync.Map).Range(func(k, v interface{}) bool {
+		if _, ok := objByKey[k.(kube.ResourceKey)]; !ok {
+			c.onNodeRemoved(k.(kube.ResourceKey))
 		}
-
-		if _, ok := objByKey[key]; !ok {
-			c.onNodeRemoved(key)
-		}
-	}
+		return true
+	})
 }
 
 func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
@@ -495,25 +514,25 @@ func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
 
 func (c *clusterCache) setNode(n *Resource) {
 	key := n.ResourceKey()
-	c.resources[key] = n
-	ns, ok := c.nsIndex[key.Namespace]
-	if !ok {
-		ns = make(map[kube.ResourceKey]*Resource)
-		c.nsIndex[key.Namespace] = ns
-	}
-	ns[key] = n
+
+	resourcesByKind, _ := c.resources.resourcesByKinds.LoadOrStore(key.Kind, &sync.Map{})
+	resourcesByKind.(*sync.Map).Store(key, n)
+
+	resourcesByNamespaces, _ := c.resources.resourcesByNamespaces.LoadOrStore(key.Namespace, &sync.Map{})
+	resourcesByNamespaces.(*sync.Map).Store(key, n)
 
 	// update inferred parent references
 	if n.isInferredParentOf != nil || mightHaveInferredOwner(n) {
-		for k, v := range ns {
+		resourcesByNamespaces.(*sync.Map).Range(func(k, v interface{}) bool {
 			// update child resource owner references
-			if n.isInferredParentOf != nil && mightHaveInferredOwner(v) {
-				v.setOwnerRef(n.toOwnerRef(), n.isInferredParentOf(k))
+			if n.isInferredParentOf != nil && mightHaveInferredOwner(v.(*Resource)) {
+				v.(*Resource).setOwnerRef(n.toOwnerRef(), n.isInferredParentOf(k.(kube.ResourceKey)))
 			}
-			if mightHaveInferredOwner(n) && v.isInferredParentOf != nil {
-				n.setOwnerRef(v.toOwnerRef(), v.isInferredParentOf(n.ResourceKey()))
+			if mightHaveInferredOwner(n) && v.(*Resource).isInferredParentOf != nil {
+				n.setOwnerRef(v.(*Resource).toOwnerRef(), v.(*Resource).isInferredParentOf(n.ResourceKey()))
 			}
-		}
+			return true
+		})
 	}
 }
 
@@ -916,7 +935,7 @@ func (c *clusterCache) sync() error {
 		c.apisMeta[i].watchCancel()
 	}
 	c.apisMeta = make(map[schema.GroupKind]*apiMeta)
-	c.resources = make(map[kube.ResourceKey]*Resource)
+	c.resources = NewResourceMap()
 	c.namespacedResources = make(map[schema.GroupKind]bool)
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
@@ -976,9 +995,10 @@ func (c *clusterCache) sync() error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
-						lock.Lock()
+						// lock is not needed here since we use sync map
+						// lock.Lock()
 						c.setNode(c.newResource(un))
-						lock.Unlock()
+						// lock.Unlock()
 					}
 					return nil
 				})
@@ -1051,16 +1071,27 @@ func (c *clusterCache) EnsureSynced() error {
 }
 
 func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	// lock is not needed here since we use sync map
+	// c.lock.RLock()
+	// defer c.lock.RUnlock()
 	result := map[kube.ResourceKey]*Resource{}
 	resources := map[kube.ResourceKey]*Resource{}
 	if namespace != "" {
-		if ns, ok := c.nsIndex[namespace]; ok {
-			resources = ns
+		resourcesByNamespaces, _ := c.resources.resourcesByNamespaces.Load(namespace)
+		if ns, ok := resourcesByNamespaces.(*sync.Map); ok {
+			ns.Range(func(k, v interface{}) bool {
+				resources[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
 		}
 	} else {
-		resources = c.resources
+		c.resources.resourcesByKinds.Range(func(k, v interface{}) bool {
+			v.(*sync.Map).Range(func(k, v interface{}) bool {
+				resources[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
+			return true
+		})
 	}
 
 	for k := range resources {
@@ -1107,14 +1138,25 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 	duration := lockAcquired.Sub(start)
 	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
 
-	if res, ok := c.resources[key]; ok {
-		nsNodes := c.nsIndex[key.Namespace]
-		if !action(res, nsNodes) {
+	resourcesByKind, _ := c.resources.resourcesByKinds.Load(key.Kind)
+
+	// if res, ok := c.resources[key]; ok {
+	if res, ok := resourcesByKind.(*sync.Map).Load(key); ok {
+		resourcesByNamespace, _ := c.resources.resourcesByNamespaces.Load(key.Namespace)
+		nsNodes := make(map[kube.ResourceKey]*Resource)
+		if ns, ok := resourcesByNamespace.(*sync.Map); ok {
+			ns.Range(func(k, v interface{}) bool {
+				nsNodes[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
+		}
+
+		if !action(res.(*Resource), nsNodes) {
 			return
 		}
 		childrenByUID := make(map[types.UID][]*Resource)
 		for _, child := range nsNodes {
-			if res.isParentOf(child) {
+			if res.(*Resource).isParentOf(child) {
 				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
 			}
 		}
@@ -1130,7 +1172,7 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 				})
 				child := children[0]
 				if action(child, nsNodes) {
-					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
+					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.(*Resource).ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
 						if err != nil {
 							c.log.V(2).Info(err.Error())
 							return false
@@ -1149,34 +1191,51 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 
 	log.V(1).Info("Iterating hierarchy")
 
-	start := time.Now()
-	c.lock.RLock()
-	lockAcquired := time.Now()
+	// start := time.Now()
+	// c.lock.RLock()
+	// lockAcquired := time.Now()
 
-	defer func() {
-		c.lock.RUnlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+	// defer func() {
+	// 	c.lock.RUnlock()
+	// 	lockReleased := time.Now()
+	// 	ms := lockReleased.Sub(lockAcquired).Milliseconds()
+	// 	log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
 
-		for _, handler := range c.getIterateHierarchyHandlers() {
-			handler("", "", lockReleased.Sub(start), lockAcquired.Sub(start))
-		}
-	}()
+	// 	for _, handler := range c.getIterateHierarchyHandlers() {
+	// 		handler("", "", lockReleased.Sub(start), lockAcquired.Sub(start))
+	// 	}
+	// }()
 
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+	// duration := lockAcquired.Sub(start)
+	// log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+
+	resources := map[kube.ResourceKey]*Resource{}
+	c.resources.resourcesByKinds.Range(func(k, v interface{}) bool {
+		v.(*sync.Map).Range(func(k, v interface{}) bool {
+			resources[k.(kube.ResourceKey)] = v.(*Resource)
+			return true
+		})
+		return true
+	})
 
 	keysPerNamespace := make(map[string][]kube.ResourceKey)
 	for _, key := range keys {
-		_, ok := c.resources[key]
+		_, ok := resources[key]
 		if !ok {
 			continue
 		}
 		keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
 	}
 	for namespace, namespaceKeys := range keysPerNamespace {
-		nsNodes := c.nsIndex[namespace]
+		resourcesByNamespace, _ := c.resources.resourcesByNamespaces.Load(namespace)
+		nsNodes := make(map[kube.ResourceKey]*Resource)
+		if ns, ok := resourcesByNamespace.(*sync.Map); ok {
+			ns.Range(func(k, v interface{}) bool {
+				nsNodes[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
+		}
+
 		graph := buildGraph(nsNodes)
 		visited := make(map[kube.ResourceKey]int)
 		for _, key := range namespaceKeys {
@@ -1184,7 +1243,7 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 		}
 		for _, key := range namespaceKeys {
 			// The check for existence of key is done above.
-			res := c.resources[key]
+			res := resources[key]
 			if visited[key] == 2 || !action(res, nsNodes) {
 				continue
 			}
@@ -1299,8 +1358,18 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 	}
 
 	managedObjs := make(map[kube.ResourceKey]*unstructured.Unstructured)
+
+	resources := map[kube.ResourceKey]*Resource{}
+	c.resources.resourcesByKinds.Range(func(k, v interface{}) bool {
+		v.(*sync.Map).Range(func(k, v interface{}) bool {
+			resources[k.(kube.ResourceKey)] = v.(*Resource)
+			return true
+		})
+		return true
+	})
+
 	// iterate all objects in live state cache to find ones associated with app
-	for key, o := range c.resources {
+	for key, o := range resources {
 		if isManaged(o) && o.Resource != nil && len(o.OwnerRefs) == 0 {
 			managedObjs[key] = o.Resource
 		}
@@ -1315,7 +1384,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 		lock.Unlock()
 
 		if managedObj == nil {
-			if existingObj, exists := c.resources[key]; exists {
+			if existingObj, exists := resources[key]; exists {
 				if existingObj.Resource != nil {
 					managedObj = existingObj.Resource
 				} else {
@@ -1388,60 +1457,96 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		return
 	}
 
-	start := time.Now()
-	c.lock.Lock()
-	lockAcquired := time.Now()
-	defer func() {
-		c.lock.Unlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-	}()
+	// start := time.Now()
+	// c.lock.Lock()
+	// lockAcquired := time.Now()
+	// defer func() {
+	// 	c.lock.Unlock()
+	// 	lockReleased := time.Now()
+	// 	ms := lockReleased.Sub(lockAcquired).Milliseconds()
+	// 	log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+	// }()
 
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
-	for _, h := range c.getResourceLockAcquireHandlers() {
-		h(event, un, duration)
-	}
+	// duration := lockAcquired.Sub(start)
+	// log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+	// for _, h := range c.getResourceLockAcquireHandlers() {
+	// 	h(event, un, duration)
+	// }
 
-	existingNode, exists := c.resources[key]
+	resourcesByKind, _ := c.resources.resourcesByKinds.Load(key.Kind)
+	existingNode, exists := resourcesByKind.(*sync.Map).Load(key)
+
 	if event == watch.Deleted {
 		if exists {
 			c.onNodeRemoved(key)
 		}
 	} else if event != watch.Deleted {
-		c.onNodeUpdated(existingNode, c.newResource(un))
+		c.onNodeUpdated(existingNode.(*Resource), c.newResource(un))
 	}
 }
 
 func (c *clusterCache) onNodeUpdated(oldRes *Resource, newRes *Resource) {
 	c.setNode(newRes)
 	for _, h := range c.getResourceUpdatedHandlers() {
-		h(newRes, oldRes, c.nsIndex[newRes.Ref.Namespace])
+		resourcesByNamespace, _ := c.resources.resourcesByNamespaces.Load(newRes.Ref.Namespace)
+
+		resources := make(map[kube.ResourceKey]*Resource)
+		if ns, ok := resourcesByNamespace.(*sync.Map); ok {
+			ns.Range(func(k, v interface{}) bool {
+				resources[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
+		}
+
+		h(newRes, oldRes, resources)
 	}
 }
 
 func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
-	existing, ok := c.resources[key]
+	resourcesByKind, _ := c.resources.resourcesByKinds.Load(key.Kind)
+
+	existing, ok := resourcesByKind.(*sync.Map).Load(key)
 	if ok {
-		delete(c.resources, key)
-		ns, ok := c.nsIndex[key.Namespace]
-		if ok {
-			delete(ns, key)
-			if len(ns) == 0 {
-				delete(c.nsIndex, key.Namespace)
+		resourcesByKind.(*sync.Map).Delete(key)
+		resourcesByNamespace, _ := c.resources.resourcesByNamespaces.Load(key.Namespace)
+		if _, ok := resourcesByNamespace.(*sync.Map); ok {
+			resourcesByNamespace.(*sync.Map).Delete(key)
+			count := 0
+			resourcesByNamespace.(*sync.Map).Range(func(key, value interface{}) bool {
+				count++
+				return true
+			})
+
+			if count == 0 {
+				c.resources.resourcesByNamespaces.Delete(key.Namespace)
 			}
+
+			nsInternal := make(map[kube.ResourceKey]*Resource)
+
+			resourcesByNamespace.(*sync.Map).Range(func(k, v interface{}) bool {
+				nsInternal[k.(kube.ResourceKey)] = v.(*Resource)
+				return true
+			})
+
 			// remove ownership references from children with inferred references
-			if existing.isInferredParentOf != nil {
-				for k, v := range ns {
-					if mightHaveInferredOwner(v) && existing.isInferredParentOf(k) {
-						v.setOwnerRef(existing.toOwnerRef(), false)
+			if existing.(*Resource).isInferredParentOf != nil {
+				for k, v := range nsInternal {
+					if mightHaveInferredOwner(v) && existing.(*Resource).isInferredParentOf(k) {
+						v.setOwnerRef(existing.(*Resource).toOwnerRef(), false)
 					}
 				}
 			}
 		}
+
+		resources := make(map[kube.ResourceKey]*Resource)
+
+		resourcesByNamespace.(*sync.Map).Range(func(k, v interface{}) bool {
+			resources[k.(kube.ResourceKey)] = v.(*Resource)
+			return true
+		})
+
 		for _, h := range c.getResourceUpdatedHandlers() {
-			h(nil, existing, ns)
+			h(nil, existing.(*Resource), resources)
 		}
 	}
 }
@@ -1459,10 +1564,19 @@ func (c *clusterCache) GetClusterInfo() ClusterInfo {
 	c.syncStatus.lock.Lock()
 	defer c.syncStatus.lock.Unlock()
 
+	counter := 0
+	c.resources.resourcesByKinds.Range(func(k, v interface{}) bool {
+		v.(*sync.Map).Range(func(k, v interface{}) bool {
+			counter++
+			return true
+		})
+		return true
+	})
+
 	return ClusterInfo{
 		APIsCount:         len(c.apisMeta),
 		K8SVersion:        c.serverVersion,
-		ResourcesCount:    len(c.resources),
+		ResourcesCount:    counter,
 		Server:            c.config.Host,
 		LastCacheSyncTime: c.syncStatus.syncTime,
 		SyncError:         c.syncStatus.syncError,
