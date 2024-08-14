@@ -62,7 +62,7 @@ func SetSettings(settings Settings) UpdateSettingsFunc {
 // SetNamespaces updates list of monitored namespaces
 func SetNamespaces(namespaces []string) UpdateSettingsFunc {
 	return func(cache *clusterCache) {
-		cache.namespaces = namespaces
+		cache.namespaces = StringList{list: namespaces}
 	}
 }
 
