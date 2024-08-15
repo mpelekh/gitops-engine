@@ -11,139 +11,103 @@ import (
 // ApisMetaMap is thread-safe map of apiMeta
 type ApisMetaMap struct {
 	log     logr.Logger
-	syncMap sync.Map
+	syncMap ConcurrentMap[schema.GroupKind, *apiMeta]
 }
 
 func (m *ApisMetaMap) Load(gk schema.GroupKind) (*apiMeta, bool) {
-	val, ok := m.syncMap.Load(gk)
-	typedVal, typeOk := val.(*apiMeta)
-	if !ok || !typeOk {
+	val, ok := m.syncMap.Get(gk)
+	if !ok {
 		return nil, false
 	}
-	return typedVal, true
+	return val, true
 }
 
 func (m *ApisMetaMap) LoadOrStore(key schema.GroupKind, val *apiMeta) (*apiMeta, bool) {
-	actual, loaded := m.syncMap.LoadOrStore(key, val)
-	if !loaded {
+	actual, ok := m.syncMap.Get(key)
+	if !ok {
+		m.syncMap.Set(key, val)
 		return val, false
 	}
-	typedVal, typeOk := actual.(*apiMeta)
-	if !typeOk {
-		return nil, false
-	}
-	return typedVal, true
+	return actual, true
 }
 
 func (m *ApisMetaMap) Store(gk schema.GroupKind, meta *apiMeta) {
-	m.syncMap.Store(gk, meta)
+	m.syncMap.Set(gk, meta)
 }
 
 func (m *ApisMetaMap) Delete(gk schema.GroupKind) {
-	m.syncMap.Delete(gk)
+	m.syncMap.Remove(gk)
 }
 
 // Range loops the map, and Range ensures every item will be load, but not guarantee missing(phantom read)
 func (m *ApisMetaMap) Range(fn func(key schema.GroupKind, value *apiMeta) bool) {
-	m.syncMap.Range(func(key, value interface{}) bool {
-		typedKey, keyTypeOk := key.(schema.GroupKind)
-		typedValue, valueTypeOk := value.(*apiMeta)
-		if !keyTypeOk || !valueTypeOk {
-			m.log.Info("Failed to cast key and value to GroupKind and *apiMeta")
-			return false
-		}
-		return fn(typedKey, typedValue)
+	m.syncMap.IterCb(func(key schema.GroupKind, value *apiMeta) {
+		fn(key, value)
 	})
 }
 
 // Len return ApisMetaMap length, roughly, it depends on the time point of Range each loop
 func (m *ApisMetaMap) Len() int {
-	length := 0
-	m.syncMap.Range(func(_, _ interface{}) bool {
-		length++
-		return true
-	})
-	return length
+	return m.syncMap.Count()
 }
 
 // ResourceMap is thread-safe map of kube.ResourceKey to *Resource
 type ResourceMap struct {
 	log     logr.Logger
-	syncMap sync.Map
+	syncMap ConcurrentMap[kube.ResourceKey, *Resource]
 }
 
 func (m *ResourceMap) Load(key kube.ResourceKey) (*Resource, bool) {
-	val, ok := m.syncMap.Load(key)
-	typedVal, typeOk := val.(*Resource)
-	if !ok || !typeOk {
+	val, ok := m.syncMap.Get(key)
+	if !ok {
 		return nil, false
 	}
-	return typedVal, true
+	return val, true
 }
 
-func (m *ResourceMap) LoadAndDelete(key kube.ResourceKey) (*Resource, bool) {
-	val, loaded := m.syncMap.LoadAndDelete(key)
-	if !loaded {
-		return nil, false
-	}
-	typedVal, typeOk := val.(*Resource)
-	if !typeOk {
-		m.log.Info("Failed to cast value to *Resource")
-		return nil, true
-	}
-	return typedVal, true
-}
+// Not needed anymore
+// func (m *ResourceMap) LoadAndDelete(key kube.ResourceKey) (*Resource, bool) {
+// 	val, loaded := m.syncMap.LoadAndDelete(key)
+// 	if !loaded {
+// 		return nil, false
+// 	}
+// 	typedVal, typeOk := val.(*Resource)
+// 	if !typeOk {
+// 		m.log.Info("Failed to cast value to *Resource")
+// 		return nil, true
+// 	}
+// 	return typedVal, true
+// }
 
 func (m *ResourceMap) LoadOrStore(key kube.ResourceKey, val *Resource) (*Resource, bool) {
-	actual, loaded := m.syncMap.LoadOrStore(key, val)
-	if !loaded {
+	actual, ok := m.syncMap.Get(key)
+	if !ok {
+		m.syncMap.Set(key, val)
 		return val, false
 	}
-	typedVal, typeOk := actual.(*Resource)
-	if !typeOk {
-		return nil, false
-	}
-	return typedVal, true
+	return actual, true
 }
 
 func (m *ResourceMap) Store(key kube.ResourceKey, resource *Resource) {
-	m.syncMap.Store(key, resource)
+	m.syncMap.Set(key, resource)
 }
 
 func (m *ResourceMap) Delete(key kube.ResourceKey) {
-	m.syncMap.Delete(key)
+	m.syncMap.Remove(key)
 }
 
 func (m *ResourceMap) Range(fn func(key kube.ResourceKey, value *Resource) bool) {
-	m.syncMap.Range(func(key, value interface{}) bool {
-		typedKey, keyTypeOk := key.(kube.ResourceKey)
-		typedValue, valueTypeOk := value.(*Resource)
-		if !keyTypeOk || !valueTypeOk {
-			m.log.Info("Failed to cast key and value to kube.ResourceKey and *Resource")
-			return false
-		}
-		return fn(typedKey, typedValue)
+	m.syncMap.IterCb(func(key kube.ResourceKey, value *Resource) {
+		fn(key, value)
 	})
 }
 
 func (m *ResourceMap) Len() int {
-	length := 0
-	m.syncMap.Range(func(_, _ interface{}) bool {
-		length++
-		return true
-	})
-	return length
+	return m.syncMap.Count()
 }
 
-// All return all of the original resources in the map, this maybe cause pointer leaks, deprecated.
-// TODO remove
-func (l *ResourceMap) All() map[kube.ResourceKey]*Resource {
-	result := make(map[kube.ResourceKey]*Resource)
-	l.Range(func(key kube.ResourceKey, value *Resource) bool {
-		result[key] = value
-		return true
-	})
-	return result
+func (m *ResourceMap) All() map[kube.ResourceKey]*Resource {
+	return m.syncMap.Items()
 }
 
 type APIResourcesInfoList struct {
@@ -217,124 +181,88 @@ func (l *APIResourcesInfoList) AddIfAbsent(info kube.APIResourceInfo) bool {
 // NamespaceResourcesMap is thread-safe map of string to *ResourceMap
 type NamespaceResourcesMap struct {
 	log     logr.Logger
-	syncMap sync.Map
+	syncMap ConcurrentMap[string, *ResourceMap]
 }
 
 func (m *NamespaceResourcesMap) Load(key string) (*ResourceMap, bool) {
-	val, ok := m.syncMap.Load(key)
-	typedVal, typeOk := val.(*ResourceMap)
-	if !ok || !typeOk {
+	val, ok := m.syncMap.Get(key)
+	if !ok {
 		return nil, false
 	}
-	return typedVal, true
+	return val, true
 }
 
 func (m *NamespaceResourcesMap) LoadOrStore(key string, val *ResourceMap) (*ResourceMap, bool) {
-	actual, loaded := m.syncMap.LoadOrStore(key, val)
-	if !loaded {
+	actual, ok := m.syncMap.Get(key)
+	if !ok {
+		m.syncMap.Set(key, val)
 		return val, false
 	}
-	typedVal, typeOk := actual.(*ResourceMap)
-	if !typeOk {
-		return nil, false
-	}
-	return typedVal, true
+	return actual, true
 }
 
 func (m *NamespaceResourcesMap) Store(key string, resource *ResourceMap) {
-	m.syncMap.Store(key, resource)
+	m.syncMap.Set(key, resource)
 }
 
 func (m *NamespaceResourcesMap) Delete(key string) {
-	m.syncMap.Delete(key)
+	m.syncMap.Remove(key)
 }
 
 func (m *NamespaceResourcesMap) Range(fn func(key string, value *ResourceMap) bool) {
-	m.syncMap.Range(func(key, value interface{}) bool {
-		typedKey, keyTypeOk := key.(string)
-		typedValue, valueTypeOk := value.(*ResourceMap)
-		if !keyTypeOk || !valueTypeOk {
-			m.log.Info("Failed to cast key and value to string and *ResourceMap")
-			return false
-		}
-		return fn(typedKey, typedValue)
+	m.syncMap.IterCb(func(key string, value *ResourceMap) {
+		fn(key, value)
 	})
 }
 
 func (m *NamespaceResourcesMap) Len() int {
-	length := 0
-	m.syncMap.Range(func(_, _ interface{}) bool {
-		length++
-		return true
-	})
-	return length
+	return m.syncMap.Count()
 }
 
 // GroupKindBoolMap is thread-safe map of schema.GroupKind to bool
 type GroupKindBoolMap struct {
 	log     logr.Logger
-	syncMap sync.Map
+	syncMap ConcurrentMap[schema.GroupKind, bool]
 }
 
 func (m *GroupKindBoolMap) Load(key schema.GroupKind) (bool, bool) {
-	val, ok := m.syncMap.Load(key)
-	typedVal, typeOk := val.(bool)
-	if !ok || !typeOk {
+	val, ok := m.syncMap.Get(key)
+	if !ok {
 		return false, false
 	}
-	return typedVal, true
+	return val, true
 }
 
 func (m *GroupKindBoolMap) LoadOrStore(key schema.GroupKind, val bool) (bool, bool) {
-	actual, loaded := m.syncMap.LoadOrStore(key, val)
-	if !loaded {
+	actual, ok := m.syncMap.Get(key)
+	if !ok {
+		m.syncMap.Set(key, val)
 		return val, false
 	}
-	typedVal, typeOk := actual.(bool)
-	if !typeOk {
-		return false, false
-	}
-	return typedVal, true
+	return actual, true
 }
 
 func (m *GroupKindBoolMap) Store(key schema.GroupKind, resource bool) {
-	m.syncMap.Store(key, resource)
+	m.syncMap.Set(key, resource)
 }
 
 func (m *GroupKindBoolMap) Delete(key schema.GroupKind) {
-	m.syncMap.Delete(key)
+	m.syncMap.Remove(key)
 }
 
 func (m *GroupKindBoolMap) Range(fn func(key schema.GroupKind, value bool) bool) {
-	m.syncMap.Range(func(key, value interface{}) bool {
-		typedKey, keyTypeOk := key.(schema.GroupKind)
-		typedValue, valueTypeOk := value.(bool)
-		if !keyTypeOk || !valueTypeOk {
-			m.log.Info("Failed to cast key and value to schema.GroupKind and bool")
-			return false
-		}
-		return fn(typedKey, typedValue)
+	m.syncMap.IterCb(func(key schema.GroupKind, value bool) {
+		fn(key, value)
 	})
 }
 
 func (m *GroupKindBoolMap) Len() int {
-	length := 0
-	m.syncMap.Range(func(_, _ interface{}) bool {
-		length++
-		return true
-	})
-	return length
+	return m.syncMap.Count()
 }
 
 func (m *GroupKindBoolMap) Reload(resources map[schema.GroupKind]bool) {
-	m.syncMap.Range(func(key, value interface{}) bool {
-		m.syncMap.Delete(key)
-		return true
-	})
-	// TODO not atomic now, need to fix
-	for kind, b := range resources {
-		m.syncMap.Store(kind, b)
-	}
+	m.syncMap.Clear()
+	m.syncMap.MSet(resources)
 }
 
 type StringList struct {
