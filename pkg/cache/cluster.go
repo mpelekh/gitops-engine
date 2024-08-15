@@ -438,6 +438,7 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 	}
 
 	// update existing nodes
+	c.log.V(1).Info("replaceResourceCache update existing nodes", "gk", gk, "ns", ns, "count", len(resources))
 	for i := range resources {
 		res := resources[i]
 
@@ -450,6 +451,8 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 		}
 	}
 
+	// remove nodes that no longer exist
+	c.log.V(1).Info("replaceResourceCache remove nodes that no longer exist", "gk", gk, "ns", ns)
 	c.resources.Range(func(key kube.ResourceKey, value *Resource) bool {
 		if key.Kind != gk.Kind || key.Group != gk.Group || ns != "" && key.Namespace != ns {
 			return true
@@ -630,6 +633,10 @@ func runSynced(lock sync.Locker, action func() error) error {
 // listResources creates list pager and enforces number of concurrent list requests
 func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.ResourceInterface, callback func(*pager.ListPager) error) (string, error) {
 	c.log.V(1).Info("listResources")
+	if err := c.listSemaphore.Acquire(ctx, 1); err != nil {
+		return "", err
+	}
+	defer c.listSemaphore.Release(1)
 	var retryCount int64 = 0
 	resourceVersion := ""
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
@@ -645,15 +652,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		listRetry.Steps = int(c.listRetryLimit)
 		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
 			var ierr error
-			duration := time.Now()
-			c.log.V(1).Info("List resources: before acquiring semaphore", "resourceVersion", resourceVersion)
-			if err := c.listSemaphore.Acquire(ctx, 1); err != nil {
-				return err
-			}
-			c.log.V(1).Info("List resources: after acquiring semaphore", "resourceVersion", resourceVersion, "duration", time.Since(duration))
 			res, ierr = resClient.List(ctx, opts)
-			c.listSemaphore.Release(1)
-			c.log.V(1).Info("List resources: after releasing semaphore", "resourceVersion", resourceVersion, "duration", time.Since(duration))
 			if ierr != nil {
 				// Log out a retry
 				if c.listRetryLimit > 1 && c.listRetryFunc(ierr) {
@@ -662,13 +661,17 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				}
 				return ierr
 			}
+			c.log.V(1).Info("Listed resources", "count", len(res.Items))
 			resourceVersion = res.GetResourceVersion()
+			c.log.V(1).Info("Resource version", "version", resourceVersion)
 			return nil
 		})
 		return res, err
 	})
 	listPager.PageBufferSize = c.listPageBufferSize
 	listPager.PageSize = c.listPageSize
+
+	c.log.V(1).Info("listResources done")
 
 	return resourceVersion, callback(listPager)
 }
