@@ -430,6 +430,8 @@ func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
 }
 
 func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Resource, ns string) {
+	start := time.Now()
+	c.log.V(1).Info("replaceResourceCache", "gk", gk, "ns", ns)
 	objByKey := make(map[kube.ResourceKey]*Resource)
 	for i := range resources {
 		objByKey[resources[i].ResourceKey()] = resources[i]
@@ -458,6 +460,7 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 		}
 		return true
 	})
+	c.log.V(1).Info("replaceResourceCache done", "gk", gk, "ns", ns, "duration", time.Since(start))
 }
 
 func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
@@ -489,6 +492,9 @@ func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
 }
 
 func (c *clusterCache) setNode(res *Resource) {
+	c.log.V(1).Info("setNode", "key", res.ResourceKey())
+	timeStart := time.Now()
+
 	key := res.ResourceKey()
 	c.resources.Store(key, res)
 
@@ -508,6 +514,8 @@ func (c *clusterCache) setNode(res *Resource) {
 			return true
 		})
 	}
+
+	c.log.V(1).Info("setNode done", "key", res.ResourceKey(), "duration", time.Since(timeStart))
 }
 
 // Invalidate cache and executes callback that optionally might update cache settings
@@ -549,6 +557,7 @@ func (syncStatus *clusterCacheSync) synced(clusterRetryTimeout time.Duration) bo
 }
 
 func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
+	c.log.V(1).Info("stopWatching", "gk", gk, "ns", ns)
 	c.apisMeta.Range(func(key schema.GroupKind, value *apiMeta) bool {
 		value.watchCancel()
 		c.apisMeta.Delete(key)
@@ -560,6 +569,8 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 
 // startMissingWatches lists supported cluster resources and start watching for changes unless watch is already running
 func (c *clusterCache) startMissingWatches() error {
+	timeStart := time.Now()
+	c.log.V(1).Info("startMissingWatches")
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 	if err != nil {
 		return err
@@ -606,6 +617,7 @@ func (c *clusterCache) startMissingWatches() error {
 		}
 	}
 	c.namespacedResources.Reload(namespacedResources)
+	c.log.V(1).Info("startMissingWatches done", "duration", time.Since(timeStart))
 	return nil
 }
 
@@ -617,6 +629,7 @@ func runSynced(lock sync.Locker, action func() error) error {
 
 // listResources creates list pager and enforces number of concurrent list requests
 func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.ResourceInterface, callback func(*pager.ListPager) error) (string, error) {
+	c.log.V(1).Info("listResources")
 	var retryCount int64 = 0
 	resourceVersion := ""
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
@@ -632,11 +645,15 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		listRetry.Steps = int(c.listRetryLimit)
 		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
 			var ierr error
+			duration := time.Now()
+			c.log.V(1).Info("List resources: before acquiring semaphore", "resourceVersion", resourceVersion)
 			if err := c.listSemaphore.Acquire(ctx, 1); err != nil {
 				return err
 			}
+			c.log.V(1).Info("List resources: after acquiring semaphore", "resourceVersion", resourceVersion, "duration", time.Since(duration))
 			res, ierr = resClient.List(ctx, opts)
 			c.listSemaphore.Release(1)
+			c.log.V(1).Info("List resources: after releasing semaphore", "resourceVersion", resourceVersion, "duration", time.Since(duration))
 			if ierr != nil {
 				// Log out a retry
 				if c.listRetryLimit > 1 && c.listRetryFunc(ierr) {
@@ -657,7 +674,9 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 }
 
 func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, lock bool) (string, error) {
-	return c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
+	start := time.Now()
+	c.log.V(1).Info("loadInitialState", "api", api.GroupKind, "ns", ns)
+	res, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 		var items []*Resource
 		err := listPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
 			if un, ok := obj.(*unstructured.Unstructured); !ok {
@@ -680,6 +699,9 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 			return nil
 		}
 	})
+	c.log.V(1).Info("loadInitialState done", "api", api.GroupKind, "ns", ns, "duration", time.Since(start))
+
+	return res, err
 }
 
 func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, resourceVersion string) {
@@ -831,6 +853,8 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 }
 
 func (c *clusterCache) processApi(client dynamic.Interface, api kube.APIResourceInfo, callback func(resClient dynamic.ResourceInterface, ns string) error) error {
+	start := time.Now()
+	c.log.V(1).Info("processApi", "api", api.GroupKind)
 	resClient := client.Resource(api.GroupVersionResource)
 	switch {
 	// if manage whole cluster or resource is cluster level and cluster resources enabled
@@ -846,6 +870,8 @@ func (c *clusterCache) processApi(client dynamic.Interface, api kube.APIResource
 		return err
 	}
 
+	c.log.V(1).Info("processApi done", "api", api.GroupKind, "duration", time.Since(start))
+
 	return nil
 }
 
@@ -856,6 +882,7 @@ func (c *clusterCache) isRestrictedResource(err error) bool {
 
 // checkPermission runs a self subject access review to check if the controller has permissions to list the resource
 func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface authType1.SelfSubjectAccessReviewInterface, api kube.APIResourceInfo) (keep bool, err error) {
+	c.log.V(1).Info("checkPermission", "api", api.GroupKind)
 	sar := &authorizationv1.SelfSubjectAccessReview{
 		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
 			ResourceAttributes: &authorizationv1.ResourceAttributes{
@@ -911,8 +938,8 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 func (c *clusterCache) sync() error {
 	c.log.Info("Start syncing cluster")
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	// c.lock.Lock()
+	// defer c.lock.Unlock()
 	// stop all running watches
 	c.apisMeta.Range(func(key schema.GroupKind, value *apiMeta) bool {
 		value.watchCancel()
@@ -1070,6 +1097,8 @@ func (c *clusterCache) EnsureSynced() error {
 }
 
 func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource {
+	start := time.Now()
+	c.log.V(1).Info("FindResources", "namespace", namespace, "predicates", len(predicates))
 	result := map[kube.ResourceKey]*Resource{}
 	var resources *ResourceMap
 	if namespace != "" {
@@ -1095,6 +1124,7 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 		}
 		return true
 	})
+	c.log.V(1).Info("FindResources done", "namespace", namespace, "predicates", len(predicates), "duration", time.Since(start))
 	return result
 }
 
@@ -1163,6 +1193,7 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 
 // IterateHierarchy iterates resource tree starting from the specified top level resources and executes callback for each resource in the tree
 func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
+	timeStart := time.Now()
 	log := c.log.WithValues("fn", "IterateHierarchyV2")
 	log.V(1).Info("Iterating hierarchy")
 
@@ -1205,7 +1236,7 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 			visited[key] = 2
 		}
 	}
-	log.V(1).Info("Iterated hierarchy")
+	log.V(1).Info("Iterated hierarchy", "duration", time.Since(timeStart))
 }
 
 func buildGraph(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceKey]map[types.UID]*Resource {
@@ -1281,8 +1312,11 @@ func (c *clusterCache) managesNamespace(namespace string) bool {
 // The function returns all resources from cache for those `isManaged` function returns true and resources
 // specified in targetObjs list.
 func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	// c.lock.RLock()
+	// defer c.lock.RUnlock()
+
+	timeStart := time.Now()
+	c.log.V(1).Info("GetManagedLiveObjs")
 
 	for _, o := range targetObjs {
 		if c.namespaces.Len() > 0 {
@@ -1362,6 +1396,8 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 		return nil, err
 	}
 
+	c.log.V(1).Info("GetManagedLiveObjs done", "duration", time.Since(timeStart))
+
 	return managedObjs, nil
 }
 
@@ -1373,6 +1409,8 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		"namespace", un.GetNamespace(),
 		"name", un.GetName(),
 	)
+
+	timeStart := time.Now()
 
 	log.V(1).Info("Process event")
 
@@ -1393,9 +1431,12 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 	} else if event != watch.Deleted {
 		c.onNodeUpdated(existingNode, c.newResource(un))
 	}
+	c.log.V(1).Info("Processed event", "duration", time.Since(timeStart))
 }
 
 func (c *clusterCache) onNodeUpdated(oldRes *Resource, newRes *Resource) {
+	timeStart := time.Now()
+	c.log.V(1).Info("onNodeUpdated", "old", oldRes, "new", newRes)
 	c.setNode(newRes)
 	for _, h := range c.getResourceUpdatedHandlers() {
 		res, ok := c.nsIndex.Load(newRes.Ref.Namespace)
@@ -1404,9 +1445,12 @@ func (c *clusterCache) onNodeUpdated(oldRes *Resource, newRes *Resource) {
 		}
 		h(newRes, oldRes, res.All())
 	}
+	c.log.V(1).Info("onNodeUpdated done", "duration", time.Since(timeStart))
 }
 
 func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
+	timeStart := time.Now()
+	c.log.V(1).Info("onNodeRemoved", "key", key)
 	existing, ok := c.resources.Load(key)
 	if ok {
 		c.resources.Delete(key)
@@ -1432,6 +1476,7 @@ func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
 			h(nil, existing, nsAll)
 		}
 	}
+	c.log.V(1).Info("onNodeRemoved done", "duration", time.Since(timeStart))
 }
 
 var (
