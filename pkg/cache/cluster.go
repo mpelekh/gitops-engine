@@ -169,12 +169,12 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 	log := klogr.New()
 	cache := &clusterCache{
 		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
-		apisMeta:           ApisMetaMap{},
+		apisMeta:           ApisMetaMap{syncMap: NewStringer[schema.GroupKind, *apiMeta]()},
 		listPageSize:       defaultListPageSize,
 		listPageBufferSize: defaultListPageBufferSize,
 		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
-		resources:          ResourceMap{},
-		nsIndex:            NamespaceResourcesMap{},
+		resources:          ResourceMap{syncMap: NewStringer[kube.ResourceKey, *Resource]()},
+		nsIndex:            NamespaceResourcesMap{syncMap: New[*ResourceMap]()},
 		config:             config,
 		kubectl: &kube.KubectlCmd{
 			Log:    log,
@@ -492,7 +492,7 @@ func (c *clusterCache) setNode(res *Resource) {
 	key := res.ResourceKey()
 	c.resources.Store(key, res)
 
-	nsRes, _ := c.nsIndex.LoadOrStore(key.Namespace, &ResourceMap{})
+	nsRes, _ := c.nsIndex.LoadOrStore(key.Namespace, &ResourceMap{syncMap: NewStringer[kube.ResourceKey, *Resource]()})
 	nsRes.Store(key, res)
 
 	// update inferred parent references
@@ -526,8 +526,8 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	for i := range opts {
 		opts[i](c)
 	}
-	c.apisMeta = ApisMetaMap{}
-	c.namespacedResources = GroupKindBoolMap{}
+	c.apisMeta = ApisMetaMap{syncMap: NewStringer[schema.GroupKind, *apiMeta]()}
+	c.namespacedResources = GroupKindBoolMap{syncMap: NewStringer[schema.GroupKind, bool]()}
 	c.log.Info("Invalidated cluster")
 }
 
@@ -919,9 +919,9 @@ func (c *clusterCache) sync() error {
 		return true
 	})
 
-	c.apisMeta = ApisMetaMap{}
-	c.resources = ResourceMap{}
-	c.namespacedResources = GroupKindBoolMap{}
+	c.apisMeta = ApisMetaMap{syncMap: NewStringer[schema.GroupKind, *apiMeta]()}
+	c.resources = ResourceMap{syncMap: NewStringer[kube.ResourceKey, *Resource]()}
+	c.namespacedResources = GroupKindBoolMap{syncMap: NewStringer[schema.GroupKind, bool]()}
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
 

@@ -71,7 +71,11 @@ type ResourceKey struct {
 	Name      string
 }
 
-func (k *ResourceKey) String() string {
+// func (k *ResourceKey) String() string {
+// 	return fmt.Sprintf("%s/%s/%s/%s", k.Group, k.Kind, k.Namespace, k.Name)
+// }
+
+func (k ResourceKey) String() string {
 	return fmt.Sprintf("%s/%s/%s/%s", k.Group, k.Kind, k.Namespace, k.Name)
 }
 
