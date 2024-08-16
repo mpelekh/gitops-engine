@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -166,12 +165,12 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 	log := klogr.New()
 	cache := &clusterCache{
 		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
-		apisMeta:           make(map[schema.GroupKind]*apiMeta),
+		apisMeta:           NewApisMetaMap(),
 		listPageSize:       defaultListPageSize,
 		listPageBufferSize: defaultListPageBufferSize,
 		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
-		resources:          make(map[kube.ResourceKey]*Resource),
-		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
+		resources:          NewResourceMap(),
+		nsIndex:            NewNamespaceResourcesMap(),
 		config:             config,
 		kubectl: &kube.KubectlCmd{
 			Log:    log,
@@ -202,11 +201,11 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 type clusterCache struct {
 	syncStatus clusterCacheSync
 
-	apisMeta      map[schema.GroupKind]*apiMeta
+	apisMeta      *ApisMetaMap
 	serverVersion string
-	apiResources  []kube.APIResourceInfo
+	apiResources  *APIResourcesInfoList
 	// namespacedResources is a simple map which indicates a groupKind is namespaced
-	namespacedResources map[schema.GroupKind]bool
+	namespacedResources *GroupKindBoolMap
 
 	// maximum time we allow watches to run before relisting the group/kind and restarting the watch
 	watchResyncTimeout time.Duration
@@ -226,12 +225,13 @@ type clusterCache struct {
 
 	// lock is a rw lock which protects the fields of clusterInfo
 	lock      sync.RWMutex
-	resources map[kube.ResourceKey]*Resource
-	nsIndex   map[string]map[kube.ResourceKey]*Resource
+	resources *ResourceMap
+	nsIndex   *NamespaceResourcesMap
 
-	kubectl          kube.Kubectl
-	log              logr.Logger
-	config           *rest.Config
+	kubectl kube.Kubectl
+	log     logr.Logger
+	config  *rest.Config
+	// TODO: how should we handle namespaces?
 	namespaces       []string
 	clusterResources bool
 	settings         Settings
@@ -402,7 +402,7 @@ func (c *clusterCache) GetServerVersion() string {
 // updated in place (anytime new CRDs are introduced or removed). If necessary, a separate method
 // would need to be introduced to return a copy of the list so it can be iterated consistently.
 func (c *clusterCache) GetAPIResources() []kube.APIResourceInfo {
-	return c.apiResources
+	return c.apiResources.All()
 }
 
 // GetOpenAPISchema returns open API schema of supported API resources
@@ -417,29 +417,15 @@ func (c *clusterCache) GetGVKParser() *managedfields.GvkParser {
 }
 
 func (c *clusterCache) appendAPIResource(info kube.APIResourceInfo) {
-	exists := false
-	for i := range c.apiResources {
-		if c.apiResources[i].GroupKind == info.GroupKind && c.apiResources[i].GroupVersionResource.Version == info.GroupVersionResource.Version {
-			exists = true
-			break
-		}
-	}
-	if !exists {
-		c.apiResources = append(c.apiResources, info)
-	}
+	c.apiResources.AddIfAbsent(info)
 }
 
 func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
-	for i := range c.apiResources {
-		if c.apiResources[i].GroupKind == info.GroupKind && c.apiResources[i].GroupVersionResource.Version == info.GroupVersionResource.Version {
-			c.apiResources[i] = c.apiResources[len(c.apiResources)-1]
-			c.apiResources = c.apiResources[:len(c.apiResources)-1]
-			break
-		}
-	}
+	c.apiResources.Remove(info)
 }
 
 func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Resource, ns string) {
+	c.log.V(1).Info("Replacing resource cache", "group", gk.Group, "kind", gk.Kind, "namespace", ns)
 	objByKey := make(map[kube.ResourceKey]*Resource)
 	for i := range resources {
 		objByKey[resources[i].ResourceKey()] = resources[i]
@@ -448,21 +434,23 @@ func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Re
 	// update existing nodes
 	for i := range resources {
 		res := resources[i]
-		oldRes := c.resources[res.ResourceKey()]
+
+		oldRes, _ := c.resources.Load(res.ResourceKey())
 		if oldRes == nil || oldRes.ResourceVersion != res.ResourceVersion {
 			c.onNodeUpdated(oldRes, res)
 		}
 	}
 
-	for key := range c.resources {
+	c.resources.Range(func(key kube.ResourceKey, oldRes *Resource) {
 		if key.Kind != gk.Kind || key.Group != gk.Group || ns != "" && key.Namespace != ns {
-			continue
+			return
 		}
 
 		if _, ok := objByKey[key]; !ok {
 			c.onNodeRemoved(key)
 		}
-	}
+	})
+	c.log.V(1).Info("Resource cache replaced", "group", gk.Group, "kind", gk.Kind, "namespace", ns)
 }
 
 func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
@@ -495,17 +483,17 @@ func (c *clusterCache) newResource(un *unstructured.Unstructured) *Resource {
 
 func (c *clusterCache) setNode(n *Resource) {
 	key := n.ResourceKey()
-	c.resources[key] = n
-	ns, ok := c.nsIndex[key.Namespace]
+	c.resources.Store(key, n)
+	ns, ok := c.nsIndex.Load(key.Namespace)
 	if !ok {
-		ns = make(map[kube.ResourceKey]*Resource)
-		c.nsIndex[key.Namespace] = ns
+		ns = NewResourceMap()
+		c.nsIndex.Store(key.Namespace, ns)
 	}
-	ns[key] = n
+	ns.Store(key, n)
 
 	// update inferred parent references
 	if n.isInferredParentOf != nil || mightHaveInferredOwner(n) {
-		for k, v := range ns {
+		ns.Range(func(k kube.ResourceKey, v *Resource) {
 			// update child resource owner references
 			if n.isInferredParentOf != nil && mightHaveInferredOwner(v) {
 				v.setOwnerRef(n.toOwnerRef(), n.isInferredParentOf(k))
@@ -513,22 +501,19 @@ func (c *clusterCache) setNode(n *Resource) {
 			if mightHaveInferredOwner(n) && v.isInferredParentOf != nil {
 				n.setOwnerRef(v.toOwnerRef(), v.isInferredParentOf(n.ResourceKey()))
 			}
-		}
+		})
 	}
 }
 
 // Invalidate cache and executes callback that optionally might update cache settings
 func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	c.syncStatus.lock.Lock()
 	c.syncStatus.syncTime = nil
 	c.syncStatus.lock.Unlock()
 
-	for i := range c.apisMeta {
-		c.apisMeta[i].watchCancel()
-	}
+	c.apisMeta.Range(func(gk schema.GroupKind, info *apiMeta) {
+		info.watchCancel()
+	})
 	for i := range opts {
 		opts[i](c)
 	}
@@ -555,11 +540,11 @@ func (syncStatus *clusterCacheSync) synced(clusterRetryTimeout time.Duration) bo
 }
 
 func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if info, ok := c.apisMeta[gk]; ok {
+	c.log.V(1).Info(fmt.Sprintf("Stop watching: %s", gk))
+	if info, ok := c.apisMeta.Load(gk); ok {
+		c.log.V(1).Info(fmt.Sprintf("Canceling watch: %s", gk))
 		info.watchCancel()
-		delete(c.apisMeta, gk)
+		c.apisMeta.Delete(gk)
 		c.replaceResourceCache(gk, nil, ns)
 		c.log.Info(fmt.Sprintf("Stop watching: %s not found", gk))
 	}
@@ -567,6 +552,7 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 
 // startMissingWatches lists supported cluster resources and start watching for changes unless watch is already running
 func (c *clusterCache) startMissingWatches() error {
+	c.log.V(1).Info("Starting missing watches")
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
 	if err != nil {
 		return err
@@ -583,9 +569,9 @@ func (c *clusterCache) startMissingWatches() error {
 	for i := range apis {
 		api := apis[i]
 		namespacedResources[api.GroupKind] = api.Meta.Namespaced
-		if _, ok := c.apisMeta[api.GroupKind]; !ok {
+		if _, ok := c.apisMeta.Load(api.GroupKind); !ok {
 			ctx, cancel := context.WithCancel(context.Background())
-			c.apisMeta[api.GroupKind] = &apiMeta{namespaced: api.Meta.Namespaced, watchCancel: cancel}
+			c.apisMeta.Store(api.GroupKind, &apiMeta{namespaced: api.Meta.Namespaced, watchCancel: cancel})
 
 			err := c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
 				resourceVersion, err := c.loadInitialState(ctx, api, resClient, ns, false) // don't lock here, we are already in a lock before startMissingWatches is called inside watchEvents
@@ -600,7 +586,8 @@ func (c *clusterCache) startMissingWatches() error {
 					}
 					// if we are not allowed to list the resource, remove it from the watch list
 					if !keep {
-						delete(c.apisMeta, api.GroupKind)
+						c.log.Info(fmt.Sprintf("Removing restricted resource %s from watch list", api.GroupKind))
+						c.apisMeta.Delete(api.GroupKind)
 						delete(namespacedResources, api.GroupKind)
 						return nil
 					}
@@ -613,7 +600,7 @@ func (c *clusterCache) startMissingWatches() error {
 			}
 		}
 	}
-	c.namespacedResources = namespacedResources
+	c.namespacedResources.Reload(namespacedResources)
 	return nil
 }
 
@@ -665,7 +652,8 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 }
 
 func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, lock bool) (string, error) {
-	return c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
+	c.log.V(1).Info("loadInitialState: Loading initial state for resource", "groupKind", api.GroupKind, "namespace", ns)
+	version, error := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 		var items []*Resource
 		err := listPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
 			if un, ok := obj.(*unstructured.Unstructured); !ok {
@@ -689,6 +677,10 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 			return nil
 		}
 	})
+
+	c.log.V(1).Info("loadInitialState: Loaded initial state for resource", "groupKind", api.GroupKind, "namespace", ns)
+
+	return version, error
 }
 
 func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, resourceVersion string) {
@@ -699,9 +691,12 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 			}
 		}()
 
+		c.log.V(1).Info("watchEvents: starting watch", "groupKind", api.GroupKind, "namespace", ns, "resourceVersion", resourceVersion)
+
 		// load API initial state if no resource version provided
 		if resourceVersion == "" {
-			resourceVersion, err = c.loadInitialState(ctx, api, resClient, ns, true)
+			c.log.V(1).Info("watchEvents: Loading initial state for resource, resourceVersion is empty", "groupKind", api.GroupKind, "namespace", ns)
+			resourceVersion, err = c.loadInitialState(ctx, api, resClient, ns, false)
 			if err != nil {
 				return err
 			}
@@ -802,9 +797,7 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 								c.appendAPIResource(resources[i])
 							}
 						}
-						err = runSynced(&c.lock, func() error {
-							return c.startMissingWatches()
-						})
+						err = c.startMissingWatches()
 						if err != nil {
 							c.log.Error(err, "Failed to start missing watch")
 						}
@@ -912,12 +905,13 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 func (c *clusterCache) sync() error {
 	c.log.Info("Start syncing cluster")
 
-	for i := range c.apisMeta {
-		c.apisMeta[i].watchCancel()
-	}
-	c.apisMeta = make(map[schema.GroupKind]*apiMeta)
-	c.resources = make(map[kube.ResourceKey]*Resource)
-	c.namespacedResources = make(map[schema.GroupKind]bool)
+	c.apisMeta.Range(func(gk schema.GroupKind, info *apiMeta) {
+		info.watchCancel()
+	})
+
+	c.apisMeta = NewApisMetaMap()
+	c.resources = NewResourceMap()
+	c.namespacedResources = NewGroupKindBoolMap()
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
 
@@ -929,7 +923,7 @@ func (c *clusterCache) sync() error {
 	if err != nil {
 		return err
 	}
-	c.apiResources = apiResources
+	c.apiResources = &APIResourcesInfoList{list: apiResources}
 
 	openAPISchema, gvkParser, err := c.kubectl.LoadOpenAPISchema(config)
 	if err != nil {
@@ -959,16 +953,13 @@ func (c *clusterCache) sync() error {
 	if err != nil {
 		return err
 	}
-	lock := sync.Mutex{}
 	err = kube.RunAllAsync(len(apis), func(i int) error {
 		api := apis[i]
 
-		lock.Lock()
 		ctx, cancel := context.WithCancel(context.Background())
 		info := &apiMeta{namespaced: api.Meta.Namespaced, watchCancel: cancel}
-		c.apisMeta[api.GroupKind] = info
-		c.namespacedResources[api.GroupKind] = api.Meta.Namespaced
-		lock.Unlock()
+		c.apisMeta.Store(api.GroupKind, info)
+		c.namespacedResources.Store(api.GroupKind, api.Meta.Namespaced)
 
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
@@ -976,9 +967,7 @@ func (c *clusterCache) sync() error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
-						lock.Lock()
 						c.setNode(c.newResource(un))
-						lock.Unlock()
 					}
 					return nil
 				})
@@ -995,10 +984,8 @@ func (c *clusterCache) sync() error {
 					}
 					// if we are not allowed to list the resource, remove it from the watch list
 					if !keep {
-						lock.Lock()
-						delete(c.apisMeta, api.GroupKind)
-						delete(c.namespacedResources, api.GroupKind)
-						lock.Unlock()
+						c.apisMeta.Delete(api.GroupKind)
+						c.namespacedResources.Delete(api.GroupKind)
 						return nil
 					}
 				}
@@ -1033,8 +1020,8 @@ func (c *clusterCache) EnsureSynced() error {
 	}
 	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	// c.lock.Lock()
+	// defer c.lock.Unlock()
 	syncStatus.lock.Lock()
 	defer syncStatus.lock.Unlock()
 
@@ -1051,20 +1038,18 @@ func (c *clusterCache) EnsureSynced() error {
 }
 
 func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.log.V(1).Info("Finding resources", "namespace", namespace, "predicates", predicates)
 	result := map[kube.ResourceKey]*Resource{}
-	resources := map[kube.ResourceKey]*Resource{}
+	resources := NewResourceMap()
 	if namespace != "" {
-		if ns, ok := c.nsIndex[namespace]; ok {
+		if ns, ok := c.nsIndex.Load(namespace); ok {
 			resources = ns
 		}
 	} else {
 		resources = c.resources
 	}
 
-	for k := range resources {
-		r := resources[k]
+	resources.Range(func(k kube.ResourceKey, r *Resource) {
 		matches := true
 		for i := range predicates {
 			if !predicates[i](r) {
@@ -1076,71 +1061,72 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 		if matches {
 			result[k] = r
 		}
-	}
+	})
+	c.log.V(1).Info("Found resources", "count", len(result))
 	return result
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
 func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool) {
-	log := c.log.WithValues(
-		"fn", "IterateHierarchy",
-		"resource", key,
-	)
+	// log := c.log.WithValues(
+	// 	"fn", "IterateHierarchy",
+	// 	"resource", key,
+	// )
 
-	log.V(1).Info("Iterating hierarchy")
+	// log.V(1).Info("Iterating hierarchy")
 
-	start := time.Now()
-	c.lock.RLock()
-	lockAcquired := time.Now()
-	defer func() {
-		c.lock.RUnlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+	// start := time.Now()
+	// c.lock.RLock()
+	// lockAcquired := time.Now()
+	// defer func() {
+	// 	c.lock.RUnlock()
+	// 	lockReleased := time.Now()
+	// 	ms := lockReleased.Sub(lockAcquired).Milliseconds()
+	// 	log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
 
-		// Commented it, since going to collect metrics from IterateHierarchyV2
-		// for _, handler := range c.getIterateHierarchyHandlers() {
-		// 	handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
-		// }
-	}()
+	// 	// Commented it, since going to collect metrics from IterateHierarchyV2
+	// 	// for _, handler := range c.getIterateHierarchyHandlers() {
+	// 	// 	handler(key.Kind, key.Namespace, lockReleased.Sub(start), lockAcquired.Sub(start))
+	// 	// }
+	// }()
 
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+	// duration := lockAcquired.Sub(start)
+	// log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
 
-	if res, ok := c.resources[key]; ok {
-		nsNodes := c.nsIndex[key.Namespace]
-		if !action(res, nsNodes) {
-			return
-		}
-		childrenByUID := make(map[types.UID][]*Resource)
-		for _, child := range nsNodes {
-			if res.isParentOf(child) {
-				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
-			}
-		}
-		// make sure children has no duplicates
-		for _, children := range childrenByUID {
-			if len(children) > 0 {
-				// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-				// we pick the same child after every refresh.
-				sort.Slice(children, func(i, j int) bool {
-					key1 := children[i].ResourceKey()
-					key2 := children[j].ResourceKey()
-					return strings.Compare(key1.String(), key2.String()) < 0
-				})
-				child := children[0]
-				if action(child, nsNodes) {
-					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return false
-						}
-						return action(child, namespaceResources)
-					})
-				}
-			}
-		}
-	}
+	// if res, ok := c.resources[key]; ok {
+	// 	nsNodes := c.nsIndex[key.Namespace]
+	// 	if !action(res, nsNodes) {
+	// 		return
+	// 	}
+	// 	childrenByUID := make(map[types.UID][]*Resource)
+	// 	for _, child := range nsNodes {
+	// 		if res.isParentOf(child) {
+	// 			childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+	// 		}
+	// 	}
+	// 	// make sure children has no duplicates
+	// 	for _, children := range childrenByUID {
+	// 		if len(children) > 0 {
+	// 			// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
+	// 			// we pick the same child after every refresh.
+	// 			sort.Slice(children, func(i, j int) bool {
+	// 				key1 := children[i].ResourceKey()
+	// 				key2 := children[j].ResourceKey()
+	// 				return strings.Compare(key1.String(), key2.String()) < 0
+	// 			})
+	// 			child := children[0]
+	// 			if action(child, nsNodes) {
+	// 				child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
+	// 					if err != nil {
+	// 						c.log.V(2).Info(err.Error())
+	// 						return false
+	// 					}
+	// 					return action(child, namespaceResources)
+	// 				})
+	// 			}
+	// 		}
+	// 	}
+	// }
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resources and executes callback for each resource in the tree
@@ -1150,49 +1136,34 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 	log.V(1).Info("Iterating hierarchy")
 
 	start := time.Now()
-	c.lock.RLock()
-	lockAcquired := time.Now()
-
-	defer func() {
-		c.lock.RUnlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-
-		for _, handler := range c.getIterateHierarchyHandlers() {
-			handler("", "", lockReleased.Sub(start), lockAcquired.Sub(start))
-		}
-	}()
-
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
 
 	keysPerNamespace := make(map[string][]kube.ResourceKey)
 	for _, key := range keys {
-		_, ok := c.resources[key]
+		_, ok := c.resources.Load(key)
 		if !ok {
 			continue
 		}
 		keysPerNamespace[key.Namespace] = append(keysPerNamespace[key.Namespace], key)
 	}
 	for namespace, namespaceKeys := range keysPerNamespace {
-		nsNodes := c.nsIndex[namespace]
-		graph := buildGraph(nsNodes)
+		nsNodes, _ := c.nsIndex.Load(namespace)
+		nsNodesAll := nsNodes.All()
+		graph := buildGraph(nsNodesAll)
 		visited := make(map[kube.ResourceKey]int)
 		for _, key := range namespaceKeys {
 			visited[key] = 0
 		}
 		for _, key := range namespaceKeys {
 			// The check for existence of key is done above.
-			res := c.resources[key]
-			if visited[key] == 2 || !action(res, nsNodes) {
+			res, _ := c.resources.Load(key)
+			if visited[key] == 2 || !action(res, nsNodesAll) {
 				continue
 			}
 			visited[key] = 1
 			if _, ok := graph[key]; ok {
 				for _, child := range graph[key] {
-					if visited[child.ResourceKey()] == 0 && action(child, nsNodes) {
-						child.iterateChildrenV2(graph, nsNodes, visited, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
+					if visited[child.ResourceKey()] == 0 && action(child, nsNodesAll) {
+						child.iterateChildrenV2(graph, nsNodesAll, visited, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) bool {
 							if err != nil {
 								c.log.V(2).Info(err.Error())
 								return false
@@ -1205,6 +1176,7 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 			visited[key] = 2
 		}
 	}
+	c.log.V(1).Info("Iterated hierarchy", "duration", time.Since(start))
 }
 
 func buildGraph(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceKey]map[types.UID]*Resource {
@@ -1266,7 +1238,7 @@ func buildGraph(nsNodes map[kube.ResourceKey]*Resource) map[kube.ResourceKey]map
 
 // IsNamespaced answers if specified group/kind is a namespaced resource API or not
 func (c *clusterCache) IsNamespaced(gk schema.GroupKind) (bool, error) {
-	if isNamespaced, ok := c.namespacedResources[gk]; ok {
+	if isNamespaced, ok := c.namespacedResources.Load(gk); ok {
 		return isNamespaced, nil
 	}
 	return false, errors.NewNotFound(schema.GroupResource{Group: gk.Group}, "")
@@ -1285,9 +1257,8 @@ func (c *clusterCache) managesNamespace(namespace string) bool {
 // The function returns all resources from cache for those `isManaged` function returns true and resources
 // specified in targetObjs list.
 func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-
+	start := time.Now()
+	c.log.V(1).Info("GetManagedLiveObjs")
 	for _, o := range targetObjs {
 		if len(c.namespaces) > 0 {
 			if o.GetNamespace() == "" && !c.clusterResources {
@@ -1300,11 +1271,11 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 
 	managedObjs := make(map[kube.ResourceKey]*unstructured.Unstructured)
 	// iterate all objects in live state cache to find ones associated with app
-	for key, o := range c.resources {
+	c.resources.Range(func(key kube.ResourceKey, o *Resource) {
 		if isManaged(o) && o.Resource != nil && len(o.OwnerRefs) == 0 {
 			managedObjs[key] = o.Resource
 		}
-	}
+	})
 	// but are simply missing our label
 	lock := &sync.Mutex{}
 	err := kube.RunAllAsync(len(targetObjs), func(i int) error {
@@ -1315,7 +1286,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 		lock.Unlock()
 
 		if managedObj == nil {
-			if existingObj, exists := c.resources[key]; exists {
+			if existingObj, exists := c.resources.Load(key); exists {
 				if existingObj.Resource != nil {
 					managedObj = existingObj.Resource
 				} else {
@@ -1328,7 +1299,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 						return err
 					}
 				}
-			} else if _, watched := c.apisMeta[key.GroupKind()]; !watched {
+			} else if _, watched := c.apisMeta.Load(key.GroupKind()); !watched {
 				var err error
 				managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), targetObj.GetName(), targetObj.GetNamespace())
 				if err != nil {
@@ -1365,6 +1336,8 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 		return nil, err
 	}
 
+	c.log.V(1).Info("GetManagedLiveObjs", "duration", time.Since(start))
+
 	return managedObjs, nil
 }
 
@@ -1388,23 +1361,7 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		return
 	}
 
-	start := time.Now()
-	c.lock.Lock()
-	lockAcquired := time.Now()
-	defer func() {
-		c.lock.Unlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-	}()
-
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
-	for _, h := range c.getResourceLockAcquireHandlers() {
-		h(event, un, duration)
-	}
-
-	existingNode, exists := c.resources[key]
+	existingNode, exists := c.resources.Load(key)
 	if event == watch.Deleted {
 		if exists {
 			c.onNodeRemoved(key)
@@ -1417,31 +1374,34 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 func (c *clusterCache) onNodeUpdated(oldRes *Resource, newRes *Resource) {
 	c.setNode(newRes)
 	for _, h := range c.getResourceUpdatedHandlers() {
-		h(newRes, oldRes, c.nsIndex[newRes.Ref.Namespace])
+
+		val, _ := c.nsIndex.Load(newRes.Ref.Namespace)
+
+		h(newRes, oldRes, val.All())
 	}
 }
 
 func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
-	existing, ok := c.resources[key]
+	existing, ok := c.resources.Load(key)
 	if ok {
-		delete(c.resources, key)
-		ns, ok := c.nsIndex[key.Namespace]
+		c.resources.Delete(key)
+		ns, ok := c.nsIndex.Load(key.Namespace)
 		if ok {
-			delete(ns, key)
-			if len(ns) == 0 {
-				delete(c.nsIndex, key.Namespace)
+			ns.Delete(key)
+			if ns.Len() == 0 {
+				c.nsIndex.Delete(key.Namespace)
 			}
 			// remove ownership references from children with inferred references
 			if existing.isInferredParentOf != nil {
-				for k, v := range ns {
+				ns.Range(func(k kube.ResourceKey, v *Resource) {
 					if mightHaveInferredOwner(v) && existing.isInferredParentOf(k) {
 						v.setOwnerRef(existing.toOwnerRef(), false)
 					}
-				}
+				})
 			}
 		}
 		for _, h := range c.getResourceUpdatedHandlers() {
-			h(nil, existing, ns)
+			h(nil, existing, ns.All())
 		}
 	}
 }
@@ -1454,19 +1414,17 @@ var (
 
 // GetClusterInfo returns cluster cache statistics
 func (c *clusterCache) GetClusterInfo() ClusterInfo {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
 	c.syncStatus.lock.Lock()
 	defer c.syncStatus.lock.Unlock()
 
 	return ClusterInfo{
-		APIsCount:         len(c.apisMeta),
+		APIsCount:         c.apisMeta.Len(),
 		K8SVersion:        c.serverVersion,
-		ResourcesCount:    len(c.resources),
+		ResourcesCount:    c.resources.Len(),
 		Server:            c.config.Host,
 		LastCacheSyncTime: c.syncStatus.syncTime,
 		SyncError:         c.syncStatus.syncError,
-		APIResources:      c.apiResources,
+		APIResources:      c.apiResources.All(),
 	}
 }
 
