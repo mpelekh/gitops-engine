@@ -201,11 +201,11 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 type clusterCache struct {
 	syncStatus clusterCacheSync
 
-	apisMeta      *ApisMetaMap
+	apisMeta      ApisMetaMap
 	serverVersion string
-	apiResources  *APIResourcesInfoList
+	apiResources  APIResourcesInfoList
 	// namespacedResources is a simple map which indicates a groupKind is namespaced
-	namespacedResources *GroupKindBoolMap
+	namespacedResources GroupKindBoolMap
 
 	// maximum time we allow watches to run before relisting the group/kind and restarting the watch
 	watchResyncTimeout time.Duration
@@ -225,8 +225,8 @@ type clusterCache struct {
 
 	// lock is a rw lock which protects the fields of clusterInfo
 	lock      sync.RWMutex
-	resources *ResourceMap
-	nsIndex   *NamespaceResourcesMap
+	resources ResourceMap
+	nsIndex   NamespaceResourcesMap
 
 	kubectl kube.Kubectl
 	log     logr.Logger
@@ -486,7 +486,8 @@ func (c *clusterCache) setNode(n *Resource) {
 	c.resources.Store(key, n)
 	ns, ok := c.nsIndex.Load(key.Namespace)
 	if !ok {
-		ns = NewResourceMap()
+		resMap := NewResourceMap()
+		ns = &resMap
 		c.nsIndex.Store(key.Namespace, ns)
 	}
 	ns.Store(key, n)
@@ -517,8 +518,8 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	for i := range opts {
 		opts[i](c)
 	}
-	c.apisMeta = nil
-	c.namespacedResources = nil
+	c.apisMeta = NewApisMetaMap()
+	c.namespacedResources = NewGroupKindBoolMap()
 	c.log.Info("Invalidated cluster")
 }
 
@@ -923,7 +924,7 @@ func (c *clusterCache) sync() error {
 	if err != nil {
 		return err
 	}
-	c.apiResources = &APIResourcesInfoList{list: apiResources}
+	c.apiResources = APIResourcesInfoList{list: apiResources}
 
 	openAPISchema, gvkParser, err := c.kubectl.LoadOpenAPISchema(config)
 	if err != nil {
@@ -1043,7 +1044,7 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 	resources := NewResourceMap()
 	if namespace != "" {
 		if ns, ok := c.nsIndex.Load(namespace); ok {
-			resources = ns
+			resources = *ns
 		}
 	} else {
 		resources = c.resources

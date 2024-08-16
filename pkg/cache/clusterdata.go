@@ -7,8 +7,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-func NewApisMetaMap() *ApisMetaMap {
-	return &ApisMetaMap{data: NewStringer[schema.GroupKind, *apiMeta]()}
+func NewApisMetaMap() ApisMetaMap {
+	return ApisMetaMap{data: NewStringer[schema.GroupKind, *apiMeta]()}
 }
 
 // ApisMetaMap is thread-safe map of apiMeta
@@ -49,8 +49,8 @@ func (m *ApisMetaMap) Len() int {
 	return m.data.Count()
 }
 
-func NewResourceMap() *ResourceMap {
-	return &ResourceMap{data: NewStringer[kube.ResourceKey, *Resource]()}
+func NewResourceMap() ResourceMap {
+	return ResourceMap{data: NewStringer[kube.ResourceKey, *Resource]()}
 }
 
 type ResourceMap struct {
@@ -94,8 +94,8 @@ func (m *ResourceMap) All() map[kube.ResourceKey]*Resource {
 	return m.data.Items()
 }
 
-func NewAPIResourcesInfoList() *APIResourcesInfoList {
-	return &APIResourcesInfoList{}
+func NewAPIResourcesInfoList() APIResourcesInfoList {
+	return APIResourcesInfoList{}
 }
 
 type APIResourcesInfoList struct {
@@ -165,8 +165,8 @@ func (l *APIResourcesInfoList) AddIfAbsent(info kube.APIResourceInfo) bool {
 	return true
 }
 
-func NewNamespaceResourcesMap() *NamespaceResourcesMap {
-	return &NamespaceResourcesMap{data: New[*ResourceMap]()}
+func NewNamespaceResourcesMap() NamespaceResourcesMap {
+	return NamespaceResourcesMap{data: New[*ResourceMap]()}
 }
 
 type NamespaceResourcesMap struct {
@@ -206,8 +206,8 @@ func (m *NamespaceResourcesMap) Len() int {
 	return m.data.Count()
 }
 
-func NewGroupKindBoolMap() *GroupKindBoolMap {
-	return &GroupKindBoolMap{data: NewStringer[schema.GroupKind, bool]()}
+func NewGroupKindBoolMap() GroupKindBoolMap {
+	return GroupKindBoolMap{data: NewStringer[schema.GroupKind, bool]()}
 }
 
 type GroupKindBoolMap struct {
