@@ -1092,10 +1092,6 @@ func (c *clusterCache) processItems() {
 						duration := lockReleased.Sub(lockAcquired)
 						ms := duration.Milliseconds()
 						log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-						// Update the metric with the duration of the event processing
-						for _, handler := range c.getProcessEventHandlers() {
-							handler(duration)
-						}
 					}()
 
 					duration := lockAcquired.Sub(start)
@@ -1105,6 +1101,7 @@ func (c *clusterCache) processItems() {
 					}
 
 					for _, item := range items {
+						start := time.Now()
 						key := kube.GetResourceKey(item.un)
 						event := item.event
 
@@ -1114,6 +1111,12 @@ func (c *clusterCache) processItems() {
 							for _, h := range c.getResourceUpdatedHandlers() {
 								h(newRes, oldRes, ns)
 							}
+						}
+
+						duration := time.Since(start)
+						// Update the metric with the duration of the event processing
+						for _, handler := range c.getProcessEventHandlers() {
+							handler(duration)
 						}
 					}
 				}()
