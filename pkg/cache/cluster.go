@@ -75,6 +75,11 @@ type apiMeta struct {
 	watchCancel context.CancelFunc
 }
 
+type eventMeta struct {
+	event watch.EventType
+	un    *unstructured.Unstructured
+}
+
 // ClusterInfo holds cluster cache stats
 type ClusterInfo struct {
 	// Server holds cluster API server URL
@@ -103,10 +108,10 @@ type OnPopulateResourceInfoHandler func(un *unstructured.Unstructured, isRoot bo
 type OnResourceUpdatedHandler func(newRes *Resource, oldRes *Resource, namespaceResources map[kube.ResourceKey]*Resource)
 
 // OnResourceLockAcquireHandler handlers resource lock acquire event
-type OnResourceLockAcquireHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
+type OnResourceLockAcquireHandler func(duration time.Duration)
 
 // OnProcessEventHandler handlers process event
-type OnProcessEventHandler func(event watch.EventType, un *unstructured.Unstructured, duration time.Duration)
+type OnProcessEventHandler func(duration time.Duration)
 
 // OnIterateHierarchyHandler handlers resource hierarchy iteration event
 type OnIterateHierarchyHandler func(kind, namespace string, duration time.Duration, acquireLockDuration time.Duration)
@@ -163,16 +168,11 @@ type WeightedSemaphore interface {
 
 type ListRetryFunc func(err error) bool
 
-type eventMeta struct {
-	event watch.EventType
-	un    *unstructured.Unstructured
-}
-
 // NewClusterCache creates new instance of cluster cache
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
 	log := klogr.New()
 	cache := &clusterCache{
-		ch:                 make(chan eventMeta),
+		eventCh:            make(chan eventMeta),
 		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
 		apisMeta:           make(map[schema.GroupKind]*apiMeta),
 		listPageSize:       defaultListPageSize,
@@ -208,7 +208,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 }
 
 type clusterCache struct {
-	ch         chan eventMeta
+	eventCh    chan eventMeta
 	syncStatus clusterCacheSync
 
 	apisMeta      map[schema.GroupKind]*apiMeta
@@ -541,6 +541,10 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 	for i := range opts {
 		opts[i](c)
 	}
+
+	c.log.V(1).Info("Closing event channel in Invalidate method")
+	c.closeEventChannelSafely()
+
 	c.apisMeta = nil
 	c.namespacedResources = nil
 	c.log.Info("Invalidated cluster")
@@ -572,11 +576,15 @@ func (c *clusterCache) stopWatching(gk schema.GroupKind, ns string) {
 		c.replaceResourceCache(gk, nil, ns)
 		c.log.Info(fmt.Sprintf("Stop watching: %s not found", gk))
 	}
+
+	c.log.V(1).Info("Closing event channel in stopWatching method")
+	c.closeEventChannelSafely()
 }
 
 // startMissingWatches lists supported cluster resources and starts watching for changes unless watch is already running
 func (c *clusterCache) startMissingWatches() error {
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
+	c.log.V(1).Info("Start missing watches", "apis", apis)
 	if err != nil {
 		return err
 	}
@@ -842,10 +850,6 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 
 				duration := time.Since(start)
 				log.V(1).Info("Handled event from ResultChan", "duration", duration.Milliseconds())
-				// Update the metric with the duration of the event processing
-				for _, handler := range c.getProcessEventHandlers() {
-					handler(event.Type, obj, duration)
-				}
 			}
 		}
 	})
@@ -937,7 +941,8 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 func (c *clusterCache) sync() error {
 	c.log.Info("Start syncing cluster")
 
-	close(c.ch)
+	c.log.V(1).Info("Closing event channel in sync method")
+	c.closeEventChannelSafely()
 
 	for i := range c.apisMeta {
 		c.apisMeta[i].watchCancel()
@@ -947,13 +952,14 @@ func (c *clusterCache) sync() error {
 	c.namespacedResources = make(map[schema.GroupKind]bool)
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
-	c.ch = make(chan eventMeta)
+	c.eventCh = make(chan eventMeta)
 
 	if err != nil {
 		return err
 	}
 	c.serverVersion = version
 	apiResources, err := c.kubectl.GetAPIResources(config, false, NewNoopSettings())
+	c.log.V(1).Info("sync(): API resources", "resources", apiResources)
 	if err != nil {
 		return err
 	}
@@ -971,6 +977,7 @@ func (c *clusterCache) sync() error {
 	c.openAPISchema = openAPISchema
 
 	apis, err := c.kubectl.GetAPIResources(c.config, true, c.settings.ResourcesFilter)
+	c.log.V(1).Info("sync(): APIs", "apis", apis)
 
 	if err != nil {
 		return err
@@ -1053,29 +1060,27 @@ func (c *clusterCache) processItems() {
 		"fn", "processItems",
 	)
 
+	log.V(1).Info("Starting processing items")
+
 	var items []eventMeta
 
 	// Create a ticker that ticks every 1 second
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	// Infinite loop to continuously receive from the channel and process items
 	for {
 		select {
-		// Case to handle receiving items from the channel
-		case item, ok := <-c.ch:
+		// Handle receiving items from the channel
+		case item, ok := <-c.eventCh:
 			if !ok {
-				// Channel is closed
 				log.V(1).Info("Channel is closed. Exiting loop.")
 				return
 			}
-			log.V(1).Info("Put item into channel", "len", len(items))
-			// Append the received item to the items array
 			items = append(items, item)
-		// Case to handle processing the items every 1 second
+			log.V(1).Info("Put item into items slice", "len", len(items))
+		// Handle processing the items every 1 second
 		case <-ticker.C:
 			log.V(1).Info("Processing items", "len", len(items))
-			// Process the collected items
 			if len(items) > 0 {
 				func() {
 					start := time.Now()
@@ -1084,15 +1089,20 @@ func (c *clusterCache) processItems() {
 					defer func() {
 						c.lock.Unlock()
 						lockReleased := time.Now()
-						ms := lockReleased.Sub(lockAcquired).Milliseconds()
+						duration := lockReleased.Sub(lockAcquired)
+						ms := duration.Milliseconds()
 						log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+						// Update the metric with the duration of the event processing
+						for _, handler := range c.getProcessEventHandlers() {
+							handler(duration)
+						}
 					}()
 
 					duration := lockAcquired.Sub(start)
 					log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
-					// for _, h := range c.getResourceLockAcquireHandlers() {
-					// 	h(event, un, duration)
-					// }
+					for _, h := range c.getResourceLockAcquireHandlers() {
+						h(duration)
+					}
 
 					for _, item := range items {
 						key := kube.GetResourceKey(item.un)
@@ -1261,6 +1271,9 @@ func (c *clusterCache) IterateHierarchyV2(keys []kube.ResourceKey, action func(r
 		for _, handler := range c.getIterateHierarchyHandlers() {
 			handler("", "", lockReleased.Sub(start), lockAcquired.Sub(start))
 		}
+
+		duration := time.Since(start)
+		log.V(1).Info("Iterated hierarchy", "duration", duration.Milliseconds())
 	}()
 
 	duration := lockAcquired.Sub(start)
@@ -1476,7 +1489,7 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		"name", un.GetName(),
 	)
 
-	log.V(1).Info("Process event")
+	log.V(1).Info("Processing event")
 
 	for _, h := range c.getEventHandlers() {
 		h(event, un)
@@ -1487,51 +1500,11 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		return
 	}
 
-	c.ch <- eventMeta{event: event, un: un}
-
-	// ok, newRes, oldRes, ns := c.writeForResourceEvent(key, event, un)
-	// if ok {
-	// 	// Requesting a read lock, so that namespace resources aren't written to as they are being read from.
-	// 	// Since each group/kind is processed by its own goroutine, resource shouldn't be updated between
-	// 	// releasing write lock in `writeForResourceEvent` and acquiring this read lock, but namespace resources might be
-	// 	// updated by other goroutines, resulting in a potentially fresher view of resources. However, potentially all
-	// 	// of these variables can become stale if there's a cluster cache update. With respect to ArgoCD usage, either of
-	// 	// these scenarios can result in triggering refresh for a wrong app in the worst case, which should be rare and
-	// 	// doesn't hurt.
-	// 	c.lock.RLock()
-	// 	defer c.lock.RUnlock()
-	// 	for _, h := range c.getResourceUpdatedHandlers() {
-	// 		h(newRes, oldRes, ns)
-	// 	}
-	// }
+	c.eventCh <- eventMeta{event, un}
+	log.V(1).Info("Sent event to channel")
 }
 
-// Encapsulates the logic of updating the resource in the cluster cache to limit the scope of locking.
 func (c *clusterCache) writeForResourceEvent(key kube.ResourceKey, event watch.EventType, un *unstructured.Unstructured) (bool, *Resource, *Resource, map[kube.ResourceKey]*Resource) {
-	// log := c.log.WithValues(
-	// 	"fn", "writeForResourceEvent",
-	// 	"event", event,
-	// 	"kind", un.GetKind(),
-	// 	"namespace", un.GetNamespace(),
-	// 	"name", un.GetName(),
-	// )
-
-	// start := time.Now()
-	// c.lock.Lock()
-	// lockAcquired := time.Now()
-	// defer func() {
-	// 	c.lock.Unlock()
-	// 	lockReleased := time.Now()
-	// 	ms := lockReleased.Sub(lockAcquired).Milliseconds()
-	// 	log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-	// }()
-
-	// duration := lockAcquired.Sub(start)
-	// log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
-	// for _, h := range c.getResourceLockAcquireHandlers() {
-	// 	h(event, un, duration)
-	// }
-
 	existingNode, exists := c.resources[key]
 	if event == watch.Deleted {
 		if exists {
@@ -1619,4 +1592,15 @@ func (c *clusterCache) GetClusterInfo() ClusterInfo {
 // We ignore API types which have a high churn rate, and/or whose updates are irrelevant to the app
 func skipAppRequeuing(key kube.ResourceKey) bool {
 	return ignoredRefreshResources[key.Group+"/"+key.Kind]
+}
+
+func (c *clusterCache) closeEventChannelSafely() {
+	defer func() {
+		if r := recover(); r != nil {
+			c.log.V(1).Info("Recovered from panic.", "error", r)
+		}
+	}()
+
+	close(c.eventCh)
+	c.log.V(1).Info("Closed event channel")
 }
