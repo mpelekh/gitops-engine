@@ -163,10 +163,16 @@ type WeightedSemaphore interface {
 
 type ListRetryFunc func(err error) bool
 
+type eventMeta struct {
+	event watch.EventType
+	un    *unstructured.Unstructured
+}
+
 // NewClusterCache creates new instance of cluster cache
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
 	log := klogr.New()
 	cache := &clusterCache{
+		ch:                 make(chan eventMeta),
 		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
 		apisMeta:           make(map[schema.GroupKind]*apiMeta),
 		listPageSize:       defaultListPageSize,
@@ -202,6 +208,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 }
 
 type clusterCache struct {
+	ch         chan eventMeta
 	syncStatus clusterCacheSync
 
 	apisMeta      map[schema.GroupKind]*apiMeta
@@ -930,6 +937,8 @@ func (c *clusterCache) checkPermission(ctx context.Context, reviewInterface auth
 func (c *clusterCache) sync() error {
 	c.log.Info("Start syncing cluster")
 
+	close(c.ch)
+
 	for i := range c.apisMeta {
 		c.apisMeta[i].watchCancel()
 	}
@@ -938,6 +947,7 @@ func (c *clusterCache) sync() error {
 	c.namespacedResources = make(map[schema.GroupKind]bool)
 	config := c.config
 	version, err := c.kubectl.GetServerVersion(config)
+	c.ch = make(chan eventMeta)
 
 	if err != nil {
 		return err
@@ -973,6 +983,8 @@ func (c *clusterCache) sync() error {
 	if err != nil {
 		return err
 	}
+
+	go c.processItems()
 
 	// Each API is processed in parallel, so we need to take out a lock when we update clusterCache fields.
 	lock := sync.Mutex{}
@@ -1034,6 +1046,77 @@ func (c *clusterCache) sync() error {
 
 	c.log.Info("Cluster successfully synced")
 	return nil
+}
+
+func (c *clusterCache) processItems() {
+	log := c.log.WithValues(
+		"fn", "processItems",
+	)
+
+	var items []eventMeta
+
+	// Create a ticker that ticks every 1 second
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	// Infinite loop to continuously receive from the channel and process items
+	for {
+		select {
+		// Case to handle receiving items from the channel
+		case item, ok := <-c.ch:
+			if !ok {
+				// Channel is closed
+				log.V(1).Info("Channel is closed. Exiting loop.")
+				return
+			}
+			log.V(1).Info("Put item into channel", "len", len(items))
+			// Append the received item to the items array
+			items = append(items, item)
+		// Case to handle processing the items every 1 second
+		case <-ticker.C:
+			log.V(1).Info("Processing items", "len", len(items))
+			// Process the collected items
+			if len(items) > 0 {
+				func() {
+					start := time.Now()
+					c.lock.Lock()
+					lockAcquired := time.Now()
+					defer func() {
+						c.lock.Unlock()
+						lockReleased := time.Now()
+						ms := lockReleased.Sub(lockAcquired).Milliseconds()
+						log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+					}()
+
+					duration := lockAcquired.Sub(start)
+					log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+					// for _, h := range c.getResourceLockAcquireHandlers() {
+					// 	h(event, un, duration)
+					// }
+
+					for _, item := range items {
+						key := kube.GetResourceKey(item.un)
+						event := item.event
+
+						ok, newRes, oldRes, ns := c.writeForResourceEvent(key, event, item.un)
+
+						if ok {
+							for _, h := range c.getResourceUpdatedHandlers() {
+								h(newRes, oldRes, ns)
+							}
+						}
+					}
+				}()
+
+				log.V(1).Info("Processed items", "len", len(items))
+
+				// Clear the array after processing
+				items = make([]eventMeta, 0)
+			} else {
+				log.V(1).Info("No items to process", "len", len(items))
+			}
+		}
+	}
 }
 
 // EnsureSynced checks cache state and synchronizes it if necessary
@@ -1404,48 +1487,50 @@ func (c *clusterCache) processEvent(event watch.EventType, un *unstructured.Unst
 		return
 	}
 
-	ok, newRes, oldRes, ns := c.writeForResourceEvent(key, event, un)
-	if ok {
-		// Requesting a read lock, so that namespace resources aren't written to as they are being read from.
-		// Since each group/kind is processed by its own goroutine, resource shouldn't be updated between
-		// releasing write lock in `writeForResourceEvent` and acquiring this read lock, but namespace resources might be
-		// updated by other goroutines, resulting in a potentially fresher view of resources. However, potentially all
-		// of these variables can become stale if there's a cluster cache update. With respect to ArgoCD usage, either of
-		// these scenarios can result in triggering refresh for a wrong app in the worst case, which should be rare and
-		// doesn't hurt.
-		c.lock.RLock()
-		defer c.lock.RUnlock()
-		for _, h := range c.getResourceUpdatedHandlers() {
-			h(newRes, oldRes, ns)
-		}
-	}
+	c.ch <- eventMeta{event: event, un: un}
+
+	// ok, newRes, oldRes, ns := c.writeForResourceEvent(key, event, un)
+	// if ok {
+	// 	// Requesting a read lock, so that namespace resources aren't written to as they are being read from.
+	// 	// Since each group/kind is processed by its own goroutine, resource shouldn't be updated between
+	// 	// releasing write lock in `writeForResourceEvent` and acquiring this read lock, but namespace resources might be
+	// 	// updated by other goroutines, resulting in a potentially fresher view of resources. However, potentially all
+	// 	// of these variables can become stale if there's a cluster cache update. With respect to ArgoCD usage, either of
+	// 	// these scenarios can result in triggering refresh for a wrong app in the worst case, which should be rare and
+	// 	// doesn't hurt.
+	// 	c.lock.RLock()
+	// 	defer c.lock.RUnlock()
+	// 	for _, h := range c.getResourceUpdatedHandlers() {
+	// 		h(newRes, oldRes, ns)
+	// 	}
+	// }
 }
 
 // Encapsulates the logic of updating the resource in the cluster cache to limit the scope of locking.
 func (c *clusterCache) writeForResourceEvent(key kube.ResourceKey, event watch.EventType, un *unstructured.Unstructured) (bool, *Resource, *Resource, map[kube.ResourceKey]*Resource) {
-	log := c.log.WithValues(
-		"fn", "writeForResourceEvent",
-		"event", event,
-		"kind", un.GetKind(),
-		"namespace", un.GetNamespace(),
-		"name", un.GetName(),
-	)
+	// log := c.log.WithValues(
+	// 	"fn", "writeForResourceEvent",
+	// 	"event", event,
+	// 	"kind", un.GetKind(),
+	// 	"namespace", un.GetNamespace(),
+	// 	"name", un.GetName(),
+	// )
 
-	start := time.Now()
-	c.lock.Lock()
-	lockAcquired := time.Now()
-	defer func() {
-		c.lock.Unlock()
-		lockReleased := time.Now()
-		ms := lockReleased.Sub(lockAcquired).Milliseconds()
-		log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
-	}()
+	// start := time.Now()
+	// c.lock.Lock()
+	// lockAcquired := time.Now()
+	// defer func() {
+	// 	c.lock.Unlock()
+	// 	lockReleased := time.Now()
+	// 	ms := lockReleased.Sub(lockAcquired).Milliseconds()
+	// 	log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+	// }()
 
-	duration := lockAcquired.Sub(start)
-	log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
-	for _, h := range c.getResourceLockAcquireHandlers() {
-		h(event, un, duration)
-	}
+	// duration := lockAcquired.Sub(start)
+	// log.V(1).Info(fmt.Sprintf("Lock acquired in %v ms", duration.Milliseconds()), "duration", duration.Milliseconds())
+	// for _, h := range c.getResourceLockAcquireHandlers() {
+	// 	h(event, un, duration)
+	// }
 
 	existingNode, exists := c.resources[key]
 	if event == watch.Deleted {
