@@ -113,6 +113,9 @@ type OnResourceLockAcquireHandler func(duration time.Duration)
 // OnProcessEventHandler handlers process event
 type OnProcessEventHandler func(duration time.Duration)
 
+// OnProcessEventsHandler handlers process event
+type OnProcessEventsHandler func(duration time.Duration, processedEventsNumber int)
+
 // OnIterateHierarchyHandler handlers resource hierarchy iteration event
 type OnIterateHierarchyHandler func(kind, namespace string, duration time.Duration, acquireLockDuration time.Duration)
 
@@ -156,6 +159,8 @@ type ClusterCache interface {
 	OnResourceLockAcquire(handler OnResourceLockAcquireHandler) Unsubscribe
 	// OnProcessEventHandler register event handler that is executed every time when event received
 	OnProcessEventHandler(handler OnProcessEventHandler) Unsubscribe
+	// OnProcessEventsHandler register event handler that is executed every time when events were processed
+	OnProcessEventsHandler(handler OnProcessEventsHandler) Unsubscribe
 	// OnIterateHierarchyHandler register event handler that is executed every time when hierarchy is iterated
 	OnIterateHierarchyHandler(handler OnIterateHierarchyHandler) Unsubscribe
 }
@@ -195,6 +200,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		eventHandlers:              map[uint64]OnEventHandler{},
 		resourceLockAcquireHandler: map[uint64]OnResourceLockAcquireHandler{},
 		processEventHandlers:       map[uint64]OnProcessEventHandler{},
+		processEventsHandlers:      map[uint64]OnProcessEventsHandler{},
 		iterateHierarchyHandlers:   map[uint64]OnIterateHierarchyHandler{},
 		log:                        log,
 		listRetryLimit:             1,
@@ -252,6 +258,7 @@ type clusterCache struct {
 	eventHandlers               map[uint64]OnEventHandler
 	resourceLockAcquireHandler  map[uint64]OnResourceLockAcquireHandler
 	processEventHandlers        map[uint64]OnProcessEventHandler
+	processEventsHandlers       map[uint64]OnProcessEventsHandler
 	iterateHierarchyHandlers    map[uint64]OnIterateHierarchyHandler
 	openAPISchema               openapi.Resources
 	gvkParser                   *managedfields.GvkParser
@@ -371,6 +378,30 @@ func (c *clusterCache) getProcessEventHandlers() []OnProcessEventHandler {
 	defer c.handlersLock.RUnlock()
 	handlers := make([]OnProcessEventHandler, 0, len(c.processEventHandlers))
 	for _, h := range c.processEventHandlers {
+		handlers = append(handlers, h)
+	}
+	return handlers
+}
+
+// OnProcessEventHandler register event handler that is executed every time when event received
+func (c *clusterCache) OnProcessEventsHandler(handler OnProcessEventsHandler) Unsubscribe {
+	c.handlersLock.Lock()
+	defer c.handlersLock.Unlock()
+	key := c.handlerKey
+	c.handlerKey++
+	c.processEventsHandlers[key] = handler
+	return func() {
+		c.handlersLock.Lock()
+		defer c.handlersLock.Unlock()
+		delete(c.processEventsHandlers, key)
+	}
+}
+
+func (c *clusterCache) getProcessEventsHandlers() []OnProcessEventsHandler {
+	c.handlersLock.RLock()
+	defer c.handlersLock.RUnlock()
+	handlers := make([]OnProcessEventsHandler, 0, len(c.processEventsHandlers))
+	for _, h := range c.processEventsHandlers {
 		handlers = append(handlers, h)
 	}
 	return handlers
@@ -1092,6 +1123,10 @@ func (c *clusterCache) processItems() {
 						duration := lockReleased.Sub(lockAcquired)
 						ms := duration.Milliseconds()
 						log.V(1).Info(fmt.Sprintf("Lock released in %v ms", ms), "duration", ms)
+						// Update the metric with the duration of the events processing
+						for _, handler := range c.getProcessEventsHandlers() {
+							handler(time.Since(start), len(items))
+						}
 					}()
 
 					duration := lockAcquired.Sub(start)
