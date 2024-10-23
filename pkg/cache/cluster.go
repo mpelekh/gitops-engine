@@ -182,7 +182,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		},
 		watchResyncTimeout:      defaultWatchResyncTimeout,
 		clusterSyncRetryTimeout: ClusterRetryTimeout,
-		eventProcessingInterval: defaultEventProcessingInterval,
+		eventProcessingInterval: 10 * time.Second,
 		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
 		eventHandlers:           map[uint64]OnEventHandler{},
 		processEventsHandlers:   map[uint64]OnProcessEventsHandler{},
